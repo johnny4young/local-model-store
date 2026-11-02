@@ -82,7 +82,7 @@ struct Scratch {
         try Data().write(to: holdFile)
     }
 
-    func client(held: Bool = false, stallMilliseconds: Int? = nil) throws -> Process {
+    func client(held: Bool = false, stallMilliseconds: Int? = nil, extra: [String] = []) throws -> Process {
         let process = Process()
         process.executableURL = try clientExecutable()
         var arguments = [
@@ -91,7 +91,7 @@ struct Scratch {
         ]
         if held { arguments += ["--hold-file", holdFile.path] }
         if let stallMilliseconds { arguments += ["--stall-ms", String(stallMilliseconds)] }
-        process.arguments = arguments
+        process.arguments = arguments + extra
         process.standardOutput = FileHandle.nullDevice
         try process.run()
         return process

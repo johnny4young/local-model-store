@@ -26,9 +26,18 @@ package final class FileLock: Sendable {
     /// lock a new file before its writer. `O_CLOEXEC` keeps a spawned child from
     /// holding the lock after this process dies.
     package static func tryExclusive(at url: URL) throws -> Attempt {
+        try attempt(at: url, mode: O_EXLOCK)
+    }
+
+    /// Many readers can hold this together, and it keeps an exclusive holder out.
+    package static func tryShared(at url: URL) throws -> Attempt {
+        try attempt(at: url, mode: O_SHLOCK)
+    }
+
+    private static func attempt(at url: URL, mode: Int32) throws -> Attempt {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let descriptor = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC | O_EXLOCK | O_NONBLOCK, 0o600)
+        let descriptor = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC | mode | O_NONBLOCK, 0o600)
         if descriptor >= 0 { return .acquired(FileLock(descriptor: descriptor)) }
         let failure = errno
         switch failure {

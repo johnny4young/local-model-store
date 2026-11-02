@@ -7,12 +7,14 @@ public actor LocalModelStore {
     /// Room kept free beyond a download, so an install does not fill the disk.
     private static let freeSpaceMargin: Int64 = 64 << 20
 
-    private let layout: StoreLayout
+    nonisolated let layout: StoreLayout
+    let now: @Sendable () -> Date
     private let session: URLSession
-    private let waitPolicy: WaitPolicy
+    let waitPolicy: WaitPolicy
     private let availableCapacity: @Sendable (URL) -> Int64?
-    private var verifiedFingerprints: [String: [FileFingerprint]] = [:]
+    var verifiedFingerprints: [String: [FileFingerprint]] = [:]
     private(set) var fullInspectionCount = 0
+    private var claims: ClaimStore { ClaimStore(layout: layout, now: now) }
 
     nonisolated public let consumer: StoreConsumer
 
@@ -27,19 +29,28 @@ public actor LocalModelStore {
         consumer: StoreConsumer,
         session: URLSession,
         waitPolicy: WaitPolicy,
-        availableCapacity: @escaping @Sendable (URL) -> Int64? = LocalModelStore.volumeCapacity
+        availableCapacity: @escaping @Sendable (URL) -> Int64? = LocalModelStore.volumeCapacity,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) throws {
+        guard consumer.hasSafeBundleID else {
+            throw LocalModelStoreError.invalidConsumer(bundleID: consumer.bundleID)
+        }
         self.layout = StoreLayout(root: try location.resolvedRoot())
+        self.now = now
         self.consumer = consumer
         self.session = session
         self.waitPolicy = waitPolicy
         self.availableCapacity = availableCapacity
     }
 
+    /// The important-usage figure can read 0 outside APFS, which would report a full
+    /// disk on an external volume, so the larger of the two counts.
     package static func volumeCapacity(at url: URL) -> Int64? {
         let existing = FileManager.default.fileExists(atPath: url.path) ? url : url.deletingLastPathComponent()
-        return try? existing.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            .volumeAvailableCapacityForImportantUsage
+        let keys: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey]
+        guard let values = try? existing.resourceValues(forKeys: keys) else { return nil }
+        let important = values.volumeAvailableCapacityForImportantUsage ?? 0
+        return max(important, Int64(values.volumeAvailableCapacity ?? 0))
     }
 
     /// The exact directory a loader receives.
@@ -83,7 +94,12 @@ public actor LocalModelStore {
     ) async throws -> URL {
         let base = try directory(for: manifest)
         progress?(.verifying)
-        if await verifiedInstallation(manifest) != nil { return base }
+        // Without this app's claim, the slow path claims under the lock, so a
+        // removal in another process cannot miss it.
+        if await verifiedInstallation(manifest) != nil, claims.exists(manifest.storeKey, consumer: consumer) {
+            claims.touch(manifest.storeKey, consumer: consumer)
+            return base
+        }
         try Task.checkCancellation()
 
         // The first write of an install, so the lock cannot create the root with wider permissions.
@@ -95,23 +111,15 @@ public actor LocalModelStore {
         defer { withExtendedLifetime(lock) {} }
         // A crashed or finished holder's progress must not read as this one's.
         lock?.write(Data())
+        let version = layout.version
+        await Self.offActor { StagingDirectory.sweep(root: version) }
         progress?(.verifying)
-        if await inspect(manifest).report.isComplete { return base }
-        try Task.checkCancellation()
-        try await install(manifest, seeds: seeds, lock: lock, progress: progress)
+        if await verifiedInstallation(manifest) == nil {
+            try Task.checkCancellation()
+            try await install(manifest, seeds: seeds, lock: lock, progress: progress)
+        }
+        claims.write(manifest, consumer: consumer)
         return base
-    }
-
-    public func remove(_ manifest: ModelManifest) throws {
-        try manifest.validate()
-        verifiedFingerprints[manifest.evidenceKey] = nil
-        let model = layout.model(manifest.storeKey)
-        guard FileManager.default.fileExists(atPath: model.path) else { return }
-        // One rename takes the model away from readers; deleting it can then take its time.
-        try FileManager.default.createDirectory(at: layout.trash, withIntermediateDirectories: true)
-        let doomed = layout.trash.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.moveItem(at: model, to: doomed)
-        try FileManager.default.removeItem(at: doomed)
     }
 
     // MARK: - Internals
@@ -178,8 +186,6 @@ public actor LocalModelStore {
         lock: FileLock?,
         progress: (@Sendable (InstallEvent) -> Void)?
     ) async throws {
-        let version = layout.version
-        await Self.offActor { StagingDirectory.sweep(root: version) }
         let staging = try Self.storingResult("staging") { try StagingDirectory(root: layout.version) }
         defer { staging.remove() }
         let payload = staging.url.appendingPathComponent("payload", isDirectory: true)
@@ -250,6 +256,7 @@ public actor LocalModelStore {
         switch try Self.storingResult("publish", { try ModelInstaller.publish(staging, as: model) }) {
         case .published:
             verifiedFingerprints[manifest.evidenceKey] = fingerprints
+            waitPolicy.afterPublish?()
         case .alreadyExists:
             try await keepOrRepair(manifest, model: model, staging: staging, fingerprints: fingerprints)
         }

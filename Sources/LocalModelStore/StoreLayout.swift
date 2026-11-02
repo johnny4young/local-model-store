@@ -7,10 +7,15 @@ struct StoreLayout: Sendable {
     var version: URL { root.appendingPathComponent(StoreFormat.directoryName, isDirectory: true) }
     var models: URL { version.appendingPathComponent("models", isDirectory: true) }
     var trash: URL { version.appendingPathComponent("trash", isDirectory: true) }
+    var claims: URL { version.appendingPathComponent("claims", isDirectory: true) }
 
     func model(_ key: String) -> URL { models.appendingPathComponent(key, isDirectory: true) }
     func payload(_ key: String) -> URL { model(key).appendingPathComponent("payload", isDirectory: true) }
     func installLock(_ key: String) -> URL { version.appendingPathComponent("locks/\(key).lock") }
+    func useLock(_ key: String) -> URL { version.appendingPathComponent("locks/\(key).use") }
+    func claim(_ key: String, bundleID: String) -> URL {
+        claims.appendingPathComponent("\(key)/\(bundleID).json")
+    }
 
     /// Creates the root on first write. Read paths never call this, so inspecting a
     /// store leaves nothing behind.

@@ -12,6 +12,9 @@ extension LocalModelStore {
         case invalidManifest(id: String, reason: String)
         /// A sandboxed process asked for the shared store, which it cannot reach.
         case sandboxed
+        case invalidConsumer(bundleID: String)
+        /// Another process is deleting this model right now.
+        case busy(id: String)
 
         public var errorDescription: String? {
             switch self {
@@ -29,6 +32,10 @@ extension LocalModelStore {
                 return "invalid manifest \(id): \(reason)"
             case .sandboxed:
                 return "a sandboxed process cannot use the shared model store"
+            case .invalidConsumer(let bundleID):
+                return "invalid consumer bundle ID: \(bundleID)"
+            case .busy(let id):
+                return "model \(id) is being removed"
             }
         }
     }
@@ -83,8 +90,12 @@ extension LocalModelStore {
         /// A holder that reports no progress for this long is raced, never robbed:
         /// the waiter installs on its own, and the worst outcome is wasted bytes.
         package var stallTimeout: Duration = .seconds(120)
+        /// How long a lease waits for a deletion in progress.
+        package var leaseTimeout: Duration = .seconds(5)
         /// Runs before a repair replaces a damaged install, for tests of that race.
         package var beforeRepair: (@Sendable () -> Void)?
+        /// Runs right after the commit point, for tests that crash there.
+        package var afterPublish: (@Sendable () -> Void)?
 
         package init() {}
     }
