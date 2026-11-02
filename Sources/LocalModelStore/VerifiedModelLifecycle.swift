@@ -38,7 +38,8 @@ public actor VerifiedModelLifecycle {
 
     public init(store: LocalModelStore) {
         verifyInstallation = { manifest in
-            await store.verifiedInstallation(manifest)
+            // This actor owns the fast path, so reaching the store always means a full hash.
+            await store.verifiedInstallation(manifest, forceHash: true)
         }
         installModel = { manifest, progress in
             let directory = try await store.ensureAvailable(
@@ -210,6 +211,6 @@ public actor VerifiedModelLifecycle {
     }
 
     private static func key(for manifest: ModelManifest) -> String {
-        "\(manifest.id)@\(manifest.revision)"
+        manifest.evidenceKey
     }
 }

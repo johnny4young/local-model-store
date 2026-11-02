@@ -1,5 +1,6 @@
 import Foundation
 @testable import LocalModelStore
+import os
 import Testing
 
 /// A scratch store plus a fixture upstream and manifest. Never touches a real store.
@@ -10,6 +11,7 @@ private struct Scratch {
     let manifestFile: URL
     let log: URL
     let storeRoot: URL
+    let holdFile: URL
 
     init(artifactBytes: Int = 4096) throws {
         root = FileManager.default.temporaryDirectory
@@ -18,12 +20,13 @@ private struct Scratch {
         storeRoot = root.appendingPathComponent("store", isDirectory: true)
         log = root.appendingPathComponent("events.log")
         manifestFile = root.appendingPathComponent("manifest.json")
+        holdFile = root.appendingPathComponent("release-upstream")
         try FileManager.default.createDirectory(at: upstream, withIntermediateDirectories: true)
 
         var artifacts: [ModelArtifact] = []
         for name in ["weights.bin", "vocab.json"] {
             let file = upstream.appendingPathComponent(name)
-            try Data((0..<artifactBytes).map { UInt8($0 % 251) }).write(to: file)
+            try Data(repeating: 0x5A, count: artifactBytes).write(to: file)
             artifacts.append(
                 ModelArtifact(path: name, sha256: try LocalModelStore.sha256(of: file), sizeBytes: artifactBytes))
         }
@@ -31,7 +34,8 @@ private struct Scratch {
             id: "fixture",
             displayName: "Fixture",
             folderName: "fixture",
-            resolveBase: try #require(URL(string: "https://fixture.invalid")),
+            // A host per scratch keeps parallel tests from reading each other's files.
+            resolveBase: try #require(URL(string: "https://\(UUID().uuidString).invalid")),
             revision: "rev1",
             artifacts: artifacts,
             minimumRAMGB: 0,
@@ -43,6 +47,15 @@ private struct Scratch {
         try? FileManager.default.removeItem(at: root)
     }
 
+    /// A store in this process that downloads from this scratch's upstream.
+    func store() -> LocalModelStore {
+        if let host = manifest.resolveBase.host { LocalUpstream.register(upstream, host: host) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [LocalUpstream.self]
+        return LocalModelStore(
+            rootDirectory: storeRoot, consumer: .test, session: URLSession(configuration: configuration))
+    }
+
     var events: [String] {
         ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
     }
@@ -51,13 +64,18 @@ private struct Scratch {
         events.filter { $0.hasPrefix("download /\(name) ") }.count
     }
 
-    func client(chunkMilliseconds: Int = 0, stallMilliseconds: Int? = nil) throws -> Process {
+    func releaseUpstream() throws {
+        try Data().write(to: holdFile)
+    }
+
+    func client(held: Bool = false, stallMilliseconds: Int? = nil) throws -> Process {
         let process = Process()
         process.executableURL = try clientExecutable()
         var arguments = [
             "--root", storeRoot.path, "--manifest", manifestFile.path, "--upstream", upstream.path,
-            "--log", log.path, "--chunk-ms", String(chunkMilliseconds)
+            "--log", log.path
         ]
+        if held { arguments += ["--hold-file", holdFile.path] }
         if let stallMilliseconds { arguments += ["--stall-ms", String(stallMilliseconds)] }
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
@@ -99,18 +117,22 @@ private func finish(_ process: Process) async {
     }
 }
 
-private actor Events {
-    private(set) var all: [LocalModelStore.InstallEvent] = []
-    func add(_ event: LocalModelStore.InstallEvent) { all.append(event) }
+/// Collects events synchronously, so their order is the order they were emitted.
+private final class Events: Sendable {
+    private let state = OSAllocatedUnfairLock<[LocalModelStore.InstallEvent]>(initialState: [])
+    var all: [LocalModelStore.InstallEvent] { state.withLock { $0 } }
+    func add(_ event: LocalModelStore.InstallEvent) { state.withLock { $0.append(event) } }
 }
 
 struct MultiprocessInstallTests {
     @Test func twoProcessesDownloadOnceAndBothSucceed() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let first = try scratch.client(chunkMilliseconds: 40)
+        let first = try scratch.client(held: true)
         try await scratch.waitForEvent(prefix: "download ")
-        let second = try scratch.client(chunkMilliseconds: 40)
+        let second = try scratch.client()
+        try await scratch.waitForEvent(prefix: "waiting ")
+        try scratch.releaseUpstream()
         await finish(first)
         await finish(second)
 
@@ -119,7 +141,6 @@ struct MultiprocessInstallTests {
         for artifact in scratch.manifest.artifacts {
             #expect(scratch.downloads(of: artifact.path) == 1, "\(scratch.events)")
         }
-        #expect(scratch.events.contains { $0.hasPrefix("waiting ") }, "the second process must wait")
         #expect(scratch.events.filter { $0.hasPrefix("installed ") }.count == 2)
         #expect(scratch.stagingEntries().isEmpty)
     }
@@ -127,9 +148,8 @@ struct MultiprocessInstallTests {
     @Test func aKilledHolderReleasesTheLockAndItsWorkIsSwept() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let holder = try scratch.client(chunkMilliseconds: 2_000)
+        let holder = try scratch.client(held: true)
         try await scratch.waitForEvent(prefix: "download ")
-        holder.terminate()
         kill(holder.processIdentifier, SIGKILL)
         await finish(holder)
         #expect(!scratch.stagingEntries().isEmpty, "the killed holder leaves its staging behind")
@@ -146,7 +166,7 @@ struct MultiprocessInstallTests {
     @Test func aStalledHolderIsRacedAndTheInstallStaysCorrect() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let stalled = try scratch.client(chunkMilliseconds: 2_000)
+        let stalled = try scratch.client(held: true)
         try await scratch.waitForEvent(prefix: "download ")
         kill(stalled.processIdentifier, SIGSTOP)
         defer {
@@ -180,10 +200,10 @@ struct InstallLockTests {
             rootDirectory: scratch.storeRoot, consumer: .test, session: .shared, waitPolicy: policy)
         let manifest = scratch.manifest
         let install = Task {
-            try await store.ensureAvailable(manifest) { event in Task { await events.add(event) } }
+            try await store.ensureAvailable(manifest) { events.add($0) }
         }
         let deadline = ContinuousClock.now + .seconds(10)
-        while await !events.all.contains(where: { if case .waitingForOtherProcess = $0 { true } else { false } }),
+        while !events.all.contains(where: { if case .waitingForOtherProcess = $0 { true } else { false } }),
               ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -209,6 +229,32 @@ struct InstallLockTests {
         withExtendedLifetime(lock) {}
     }
 
+    @Test func anUnsupportedVolumeStillGetsAStagingDirectory() throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let staging = try StagingDirectory(root: scratch.storeRoot) { _ in .unsupported }
+        #expect(FileManager.default.fileExists(atPath: staging.url.path))
+        staging.remove()
+    }
+
+    @Test func aNewHolderClearsAFinishedHoldersProgress() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let url = scratch.storeRoot.appendingPathComponent("locks/fixture@rev1.lock")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(#"{"completedBytes":99,"totalBytes":100}"#.utf8).write(to: url)
+        let contents = OSAllocatedUnfairLock<[Data]>(initialState: [])
+        let store = scratch.store()
+        try await store.ensureAvailable(scratch.manifest) { event in
+            guard case .verifying = event, let data = try? Data(contentsOf: url) else { return }
+            contents.withLock { $0.append(data) }
+        }
+        let seen = contents.withLock { $0 }
+        #expect(seen.count == 3, "start, after the lock, and the final pass")
+        #expect(seen[0] != Data())
+        #expect(seen[1] == Data(), "once the lock is held, old progress must be gone")
+    }
+
     @Test func aSweepKeepsLiveWorkAndRemovesOrphans() throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
@@ -227,13 +273,8 @@ struct InstallLockTests {
 struct FingerprintTests {
     private func installed() async throws -> (Scratch, LocalModelStore, URL) {
         let scratch = try Scratch()
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [LocalUpstream.self]
-        LocalUpstream.register(scratch.upstream, for: scratch.manifest.id)
-        let manifest = scratch.manifest
-        let store = LocalModelStore(
-            rootDirectory: scratch.storeRoot, consumer: .test, session: URLSession(configuration: configuration))
-        let directory = try await store.ensureAvailable(manifest)
+        let store = scratch.store()
+        let directory = try await store.ensureAvailable(scratch.manifest)
         return (scratch, store, directory)
     }
 
@@ -297,32 +338,140 @@ struct FingerprintTests {
         }
     }
 
-    @Test func downloadsReportByteProgress() async throws {
-        let scratch = try Scratch(artifactBytes: 256 * 1024)
+    /// Runs over real HTTP, because `URLProtocol` stubs and URLSession's delegate
+    /// callbacks do not behave the way a real transfer does.
+    @Test func aRealHTTPDownloadReportsBytesInsideAnArtifact() async throws {
+        let artifactBytes = 3 << 20
+        let scratch = try Scratch(artifactBytes: artifactBytes)
         defer { scratch.cleanUp() }
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [LocalUpstream.self]
-        LocalUpstream.register(scratch.upstream, for: scratch.manifest.id)
+        let server = try await LoopbackServer(root: scratch.upstream, pause: .milliseconds(800))
+        defer { server.stop() }
+        let manifest = scratch.manifest.served(from: try #require(URL(string: "http://127.0.0.1:\(server.port)")))
         let store = LocalModelStore(
-            rootDirectory: scratch.storeRoot, consumer: .test, session: URLSession(configuration: configuration))
+            rootDirectory: scratch.storeRoot, consumer: .test, session: URLSession(configuration: .ephemeral))
+
         let events = Events()
-        try await store.ensureAvailable(scratch.manifest) { event in Task { await events.add(event) } }
-        try await Task.sleep(for: .milliseconds(50))
-        let all = await events.all
+        try await store.ensureAvailable(manifest) { events.add($0) }
+
+        let all = events.all
         #expect(all.first == .verifying)
+        #expect(all.last == .verifying, "the final hash pass is never reported as a download")
         let downloaded = all.compactMap { event -> Int? in
             if case .downloading(let progress) = event { progress.completedBytes } else { nil }
         }
-        #expect(downloaded.contains { $0 > 0 && $0 < scratch.manifest.totalSizeBytes }, "\(downloaded)")
+        // Artifact boundaries are reported without any byte count, so only a value
+        // inside an artifact proves bytes are reported.
+        #expect(downloaded.contains { $0 % artifactBytes != 0 }, "\(downloaded)")
+        #expect(await store.verify(manifest).isComplete)
+    }
+
+    @Test func cancellingARealDownloadThrowsCancellation() async throws {
+        let scratch = try Scratch(artifactBytes: 3 << 20)
+        defer { scratch.cleanUp() }
+        let server = try await LoopbackServer(root: scratch.upstream, pause: .seconds(60))
+        defer { server.stop() }
+        let manifest = scratch.manifest.served(from: try #require(URL(string: "http://127.0.0.1:\(server.port)")))
+        let store = LocalModelStore(
+            rootDirectory: scratch.storeRoot, consumer: .test, session: URLSession(configuration: .ephemeral))
+
+        let events = Events()
+        let install = Task { try await store.ensureAvailable(manifest) { events.add($0) } }
+        let deadline = ContinuousClock.now + .seconds(20)
+        while !events.all.contains(where: { if case .downloading = $0 { true } else { false } }),
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        install.cancel()
+        await #expect(throws: CancellationError.self) { try await install.value }
+        #expect(scratch.stagingEntries().isEmpty)
+    }
+
+    @Test func cancellingDuringTheFinalPassIsNotReportedAsCorruption() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let store = scratch.store()
+        let manifest = scratch.manifest
+        let install = Task {
+            try await store.ensureAvailable(manifest) { event in
+                // Called on the installing task, right before the final hash pass.
+                if case .downloading(let progress) = event, progress.currentPath.isEmpty {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+            }
+        }
+        await #expect(throws: CancellationError.self) { try await install.value }
+    }
+
+    @Test func evidenceForOnePinSetSaysNothingAboutAnother() async throws {
+        let (scratch, store, _) = try await installed()
+        defer { scratch.cleanUp() }
+        let original = scratch.manifest
+        let repinned = ModelManifest(
+            id: original.id,
+            displayName: original.displayName,
+            folderName: original.folderName,
+            resolveBase: original.resolveBase,
+            revision: original.revision,
+            artifacts: original.artifacts.map {
+                ModelArtifact(path: $0.path, sha256: String(repeating: "0", count: 64), sizeBytes: $0.sizeBytes)
+            },
+            minimumRAMGB: original.minimumRAMGB,
+            license: original.license)
+
+        #expect(await store.verifiedInstallation(original) != nil)
+        #expect(await store.verifiedInstallation(repinned) == nil)
+
+        let lifecycle = VerifiedModelLifecycle(store: store)
+        #expect(await lifecycle.installation(for: original) != nil)
+        #expect(await lifecycle.installation(for: repinned) == nil)
+    }
+
+    @Test func aFileRemovedWhileHashingIsNotVerified() async throws {
+        let (scratch, _, directory) = try await installed()
+        defer { scratch.cleanUp() }
+        let file = directory.appendingPathComponent("weights.bin")
+
+        let inspection = LocalModelStore.inspectFiles(of: scratch.manifest, at: directory) {
+            try? FileManager.default.removeItem(at: file)
+        }
+
+        #expect(inspection.report.missing == ["weights.bin"])
+        #expect(inspection.fingerprints == nil)
+    }
+
+    @Test func aFileReplacedWhileHashingIsNotVerified() async throws {
+        let (scratch, _, directory) = try await installed()
+        defer { scratch.cleanUp() }
+        let file = directory.appendingPathComponent("vocab.json")
+
+        let inspection = LocalModelStore.inspectFiles(of: scratch.manifest, at: directory) {
+            try? Data(repeating: 0, count: 4096).write(to: file, options: .atomic)
+        }
+
+        #expect(inspection.report.corrupted == ["vocab.json"])
+        #expect(inspection.fingerprints == nil)
+    }
+
+    @Test func aDanglingSymlinkIsRepairedInPlace() async throws {
+        let (scratch, store, directory) = try await installed()
+        defer { scratch.cleanUp() }
+        let file = directory.appendingPathComponent("weights.bin")
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createSymbolicLink(
+            at: file, withDestinationURL: scratch.root.appendingPathComponent("does-not-exist"))
+
+        try await store.ensureAvailable(scratch.manifest)
+
+        #expect(await store.verify(scratch.manifest).isComplete)
+        #expect(!FileManager.default.fileExists(atPath: scratch.root.appendingPathComponent("does-not-exist").path))
     }
 }
 
 private final class LocalUpstream: URLProtocol, @unchecked Sendable {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var directories: [URL] = []
+    private static let directories = OSAllocatedUnfairLock<[String: URL]>(initialState: [:])
 
-    static func register(_ directory: URL, for _: String) {
-        lock.withLock { directories.append(directory) }
+    static func register(_ directory: URL, host: String) {
+        directories.withLock { $0[host] = directory }
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -331,11 +480,11 @@ private final class LocalUpstream: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         guard let url = request.url, let client else { return }
-        let candidates = Self.lock.withLock { Self.directories }
-        let data = candidates.lazy.compactMap { try? Data(contentsOf: $0.appendingPathComponent(url.lastPathComponent)) }.last
-        guard let data, let response = HTTPURLResponse(
-            url: url, statusCode: 200, httpVersion: nil,
-            headerFields: ["Content-Length": String(data.count)]) else {
+        let directory = url.host.flatMap { host in Self.directories.withLock { $0[host] } }
+        guard let data = directory.flatMap({ try? Data(contentsOf: $0.appendingPathComponent(url.lastPathComponent)) }),
+              let response = HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Length": String(data.count)]) else {
             client.urlProtocol(self, didFailWithError: URLError(.fileDoesNotExist))
             return
         }

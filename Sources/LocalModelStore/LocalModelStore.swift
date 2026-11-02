@@ -83,7 +83,7 @@ public actor LocalModelStore {
         package init() {}
     }
 
-    private struct Inspection: Sendable {
+    struct Inspection: Sendable {
         let report: VerificationReport
         /// Present only when every file hashed clean and stayed unchanged meanwhile.
         let fingerprints: [FileFingerprint]?
@@ -100,10 +100,7 @@ public actor LocalModelStore {
     /// Root and consumer are always explicit, so no caller can reach a real
     /// store by accident.
     public init(rootDirectory: URL, consumer: StoreConsumer, session: URLSession = .shared) {
-        self.rootDirectory = rootDirectory
-        self.consumer = consumer
-        self.session = session
-        self.waitPolicy = WaitPolicy()
+        self.init(rootDirectory: rootDirectory, consumer: consumer, session: session, waitPolicy: WaitPolicy())
     }
 
     package init(rootDirectory: URL, consumer: StoreConsumer, session: URLSession, waitPolicy: WaitPolicy) {
@@ -136,7 +133,7 @@ public actor LocalModelStore {
 
     /// Whether the files still match the ones last hashed clean. No file is read.
     public func fingerprintIsCurrent(_ manifest: ModelManifest) -> Bool {
-        guard let expected = verifiedFingerprints[Self.key(for: manifest)] else { return false }
+        guard let expected = verifiedFingerprints[manifest.evidenceKey] else { return false }
         return Self.fingerprints(of: manifest, at: directory(for: manifest)) == expected
     }
 
@@ -157,6 +154,9 @@ public actor LocalModelStore {
         // because every published file is hashed first.
         let lock = try await acquireInstallLock(for: manifest, progress: progress)
         defer { withExtendedLifetime(lock) {} }
+        // A crashed or finished holder's progress must not read as this one's.
+        lock?.write(Data())
+        progress?(.verifying)
         let report = await inspect(manifest).report
         if report.isComplete { return base }
         try Task.checkCancellation()
@@ -166,7 +166,7 @@ public actor LocalModelStore {
 
     public func remove(_ manifest: ModelManifest) throws {
         let base = directory(for: manifest)
-        verifiedFingerprints[Self.key(for: manifest)] = nil
+        verifiedFingerprints[manifest.evidenceKey] = nil
         if FileManager.default.fileExists(atPath: base.path) {
             try FileManager.default.removeItem(at: base)
         }
@@ -182,12 +182,8 @@ public actor LocalModelStore {
             artifactBytes: Int64(manifest.totalSizeBytes))
     }
 
-    private static func key(for manifest: ModelManifest) -> String {
-        "\(manifest.id)@\(manifest.revision)"
-    }
-
     private func installLockURL(for manifest: ModelManifest) -> URL {
-        rootDirectory.appendingPathComponent("locks/\(Self.key(for: manifest)).lock")
+        rootDirectory.appendingPathComponent("locks/\(manifest.id)@\(manifest.revision).lock")
     }
 
     private func acquireInstallLock(
@@ -207,13 +203,15 @@ public actor LocalModelStore {
             }
             let report = try? Data(contentsOf: url)
             if !announced || report != lastReport {
-                announced = true
                 lastReport = report
                 lastChange = clock.now
                 let snapshot = report.flatMap { try? JSONDecoder().decode(ProgressReport.self, from: $0) }
-                progress?(.waitingForOtherProcess(
-                    completedBytes: snapshot?.completedBytes ?? 0,
-                    totalBytes: snapshot?.totalBytes ?? manifest.totalSizeBytes))
+                if !announced || snapshot != nil {
+                    announced = true
+                    progress?(.waitingForOtherProcess(
+                        completedBytes: snapshot?.completedBytes ?? 0,
+                        totalBytes: snapshot?.totalBytes ?? manifest.totalSizeBytes))
+                }
             }
             if clock.now - lastChange >= waitPolicy.stallTimeout { return nil }
             try await Task.sleep(for: waitPolicy.pollInterval)
@@ -223,20 +221,34 @@ public actor LocalModelStore {
     private func inspect(_ manifest: ModelManifest) async -> Inspection {
         fullInspectionCount += 1
         let base = directory(for: manifest)
-        let task = Task.detached(priority: .utility) { Self.inspectFiles(of: manifest, at: base) }
-        let inspection = await withTaskCancellationHandler {
+        let inspection = await Self.offActor { Self.inspectFiles(of: manifest, at: base) }
+        verifiedFingerprints[manifest.evidenceKey] = inspection.fingerprints
+        return inspection
+    }
+
+    /// Hashing takes seconds, so it runs away from the actor and stops when the
+    /// caller is cancelled.
+    nonisolated private static func offActor<Value: Sendable>(
+        _ work: @escaping @Sendable () -> Value
+    ) async -> Value {
+        let task = Task.detached(priority: .utility, operation: work)
+        return await withTaskCancellationHandler {
             await task.value
         } onCancel: {
             task.cancel()
         }
-        verifiedFingerprints[Self.key(for: manifest)] = inspection.fingerprints
-        return inspection
     }
 
-    nonisolated private static func inspectFiles(of manifest: ModelManifest, at base: URL) -> Inspection {
+    /// A file that changes while it is hashed does not count as verified: the open
+    /// handle would keep reading a deleted or replaced file to a clean result.
+    nonisolated static func inspectFiles(
+        of manifest: ModelManifest,
+        at base: URL,
+        afterHashing: () -> Void = {}
+    ) -> Inspection {
         var missing: [String] = []
         var corrupted: [String] = []
-        var before: [FileFingerprint] = []
+        var hashed: [(artifact: ModelArtifact, fingerprint: FileFingerprint)] = []
         for artifact in manifest.artifacts {
             let url = base.appendingPathComponent(artifact.path)
             switch FileFingerprint.read(url) {
@@ -245,13 +257,23 @@ public actor LocalModelStore {
             case .irregular:
                 corrupted.append(artifact.path)
             case .regular(let fingerprint):
-                before.append(fingerprint)
-                if (try? sha256(of: url)) != artifact.sha256 { corrupted.append(artifact.path) }
+                if (try? sha256(of: url)) == artifact.sha256 {
+                    hashed.append((artifact, fingerprint))
+                } else {
+                    corrupted.append(artifact.path)
+                }
+            }
+        }
+        afterHashing()
+        for (artifact, fingerprint) in hashed {
+            switch FileFingerprint.read(base.appendingPathComponent(artifact.path)) {
+            case .regular(fingerprint): continue
+            case .missing: missing.append(artifact.path)
+            case .regular, .irregular: corrupted.append(artifact.path)
             }
         }
         let report = VerificationReport(missing: missing, corrupted: corrupted)
-        let stable = report.isComplete && fingerprints(of: manifest, at: base) == before
-        return Inspection(report: report, fingerprints: stable ? before : nil)
+        return Inspection(report: report, fingerprints: report.isComplete ? hashed.map(\.fingerprint) : nil)
     }
 
     nonisolated private static func fingerprints(of manifest: ModelManifest, at base: URL) -> [FileFingerprint]? {
@@ -295,7 +317,9 @@ public actor LocalModelStore {
         progress?(.downloading(DownloadProgress(completedBytes: totalBytes, totalBytes: totalBytes, currentPath: "")))
 
         // Paranoia pass: everything the manifest lists must now hash clean.
+        progress?(.verifying)
         let final = await inspect(manifest).report
+        try Task.checkCancellation()
         guard final.isComplete else {
             throw LocalModelStoreError.notInstalled(missing: final.missing, corrupted: final.corrupted)
         }
@@ -310,36 +334,29 @@ public actor LocalModelStore {
     ) async throws {
         let source = manifest.downloadURL(for: artifact)
         let destination = base.appendingPathComponent(artifact.path)
+        let staged = staging.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: staged) }
 
-        let temporary: URL
         let response: URLResponse
         do {
-            (temporary, response) = try await session.download(
-                from: source, delegate: DownloadObserver(onBytes: onBytes))
+            response = try await ArtifactDownload.run(
+                session: session, from: source, to: staged, onBytes: onBytes)
         } catch {
+            try Task.checkCancellation()
             // URLSession also writes its temporary download to disk.
             if Self.isOutOfSpace(error as NSError) { throw LocalModelStoreError.outOfSpace(path: artifact.path) }
             throw LocalModelStoreError.downloadFailed(
                 path: artifact.path, underlying: String(describing: error))
         }
-        defer { try? FileManager.default.removeItem(at: temporary) }
 
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw LocalModelStoreError.downloadFailed(path: artifact.path, underlying: "HTTP \(http.statusCode)")
         }
 
         try Task.checkCancellation()
-        let staged = staging.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: staged) }
         try Self.storing(artifact.path) {
             try FileManager.default.createDirectory(
                 at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-            do {
-                try FileManager.default.moveItem(at: temporary, to: staged)
-            } catch {
-                try? FileManager.default.removeItem(at: staged)
-                try FileManager.default.copyItem(at: temporary, to: staged)
-            }
         }
 
         let size = (try? FileManager.default.attributesOfItem(atPath: staged.path)[.size] as? Int) ?? -1
@@ -348,7 +365,7 @@ public actor LocalModelStore {
                 path: artifact.path, expected: artifact.sizeBytes, actual: size)
         }
 
-        let digest = try await Task.detached(priority: .utility) { try Self.sha256(of: staged) }.value
+        let digest = try await Self.offActor { Result { try Self.sha256(of: staged) } }.get()
         guard digest == artifact.sha256 else {
             throw LocalModelStoreError.checksumMismatch(
                 path: artifact.path, expected: artifact.sha256, actual: digest)
@@ -360,13 +377,11 @@ public actor LocalModelStore {
         try Self.storing(artifact.path) { try Self.publish(staged, at: destination) }
     }
 
+    /// `rename` replaces a file or symlink atomically, and two writers racing with
+    /// the same verified bytes both succeed.
     private static func publish(_ staged: URL, at destination: URL) throws {
-        if FileManager.default.fileExists(atPath: destination.path) {
-            _ = try FileManager.default.replaceItemAt(
-                destination,
-                withItemAt: staged)
-        } else {
-            try FileManager.default.moveItem(at: staged, to: destination)
+        guard rename(staged.path, destination.path) == 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
         }
     }
 
@@ -421,29 +436,4 @@ private struct ProgressReport: Codable {
     let totalBytes: Int
 
     var encoded: Data { (try? JSONEncoder().encode(self)) ?? Data() }
-}
-
-/// Forwards byte counts so waiters can tell a slow download from a stalled one.
-private final class DownloadObserver: NSObject, URLSessionDownloadDelegate, Sendable {
-    private let onBytes: @Sendable (Int) -> Void
-
-    init(onBytes: @escaping @Sendable (Int) -> Void) {
-        self.onBytes = onBytes
-    }
-
-    func urlSession(
-        _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didWriteData bytesWritten: Int64,
-        totalBytesWritten: Int64,
-        totalBytesExpectedToWrite: Int64
-    ) {
-        onBytes(Int(totalBytesWritten))
-    }
-
-    func urlSession(
-        _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didFinishDownloadingTo location: URL
-    ) {}
 }

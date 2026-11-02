@@ -5,18 +5,19 @@ import Foundation
 final class StagingDirectory {
     let url: URL
     private let ownerFile: URL
-    private let owner: FileLock
+    /// Nil on a volume with no `flock`: the work is simply never swept.
+    private let owner: FileLock?
 
-    init(root: URL) throws {
+    init(root: URL, acquire: (URL) throws -> FileLock.Attempt = FileLock.tryExclusive(at:)) throws {
         let staging = root.appendingPathComponent("staging", isDirectory: true)
         let name = UUID().uuidString
         ownerFile = staging.appendingPathComponent("\(name).owner")
         url = staging.appendingPathComponent(name, isDirectory: true)
         // The lock exists before the directory, so a sweep never sees it unowned.
-        switch try FileLock.tryExclusive(at: ownerFile) {
+        switch try acquire(ownerFile) {
         case .acquired(let lock): owner = lock
-        case .busy, .unsupported:
-            throw CocoaError(.fileLocking)
+        case .unsupported: owner = nil
+        case .busy: throw CocoaError(.fileLocking)
         }
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     }
@@ -39,8 +40,11 @@ final class StagingDirectory {
             try? FileManager.default.removeItem(at: file)
             withExtendedLifetime(lock) {}
         }
-        let remaining = Set(entries)
-        for entry in entries where !entry.hasSuffix(".owner") && !remaining.contains("\(entry).owner") {
+        // Checked now, not from the listing: an owner file always exists before its
+        // directory, but a listing can return the directory and miss the file.
+        for entry in entries where !entry.hasSuffix(".owner") {
+            guard !FileManager.default.fileExists(atPath: staging.appendingPathComponent("\(entry).owner").path)
+            else { continue }
             try? FileManager.default.removeItem(at: staging.appendingPathComponent(entry, isDirectory: true))
         }
     }

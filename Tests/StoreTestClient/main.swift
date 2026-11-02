@@ -17,13 +17,13 @@ func log(_ line: String) {
     close(descriptor)
 }
 
-/// Serves artifact bytes from a directory, in slow chunks when asked, and logs each request.
+/// Serves artifact bytes from a directory and logs each request. With a hold
+/// file, it serves nothing until that file exists, so a test decides the timing.
 final class FixtureUpstream: URLProtocol, @unchecked Sendable {
     // Read-only after launch; URLProtocol instances are created by URLSession.
     nonisolated(unsafe) static var directory = URL(fileURLWithPath: "/")
-    nonisolated(unsafe) static var chunkDelay: TimeInterval = 0
+    nonisolated(unsafe) static var holdFile: String?
     private let queue = DispatchQueue(label: "fixture-upstream")
-    private var stopped = false
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -39,25 +39,22 @@ final class FixtureUpstream: URLProtocol, @unchecked Sendable {
         }
         client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         queue.async { [self] in
-            let chunk = max(1, data.count / 8)
-            for start in stride(from: 0, to: data.count, by: chunk) where !stopped {
-                Thread.sleep(forTimeInterval: Self.chunkDelay)
-                client.urlProtocol(self, didLoad: data.subdata(in: start..<min(start + chunk, data.count)))
+            while let hold = Self.holdFile, !FileManager.default.fileExists(atPath: hold) {
+                Thread.sleep(forTimeInterval: 0.01)
             }
-            if !stopped { client.urlProtocolDidFinishLoading(self) }
+            client.urlProtocol(self, didLoad: data)
+            client.urlProtocolDidFinishLoading(self)
         }
     }
 
-    override func stopLoading() {
-        queue.async { [self] in stopped = true }
-    }
+    override func stopLoading() {}
 }
 
 guard let root = argument("root"), let manifestPath = argument("manifest"), let upstream = argument("upstream") else {
-    fatalError("usage: store-test-client --root R --manifest M --upstream U [--log L] [--chunk-ms N] [--stall-ms N]")
+    fatalError("usage: store-test-client --root R --manifest M --upstream U [--log L] [--hold-file F] [--stall-ms N]")
 }
 FixtureUpstream.directory = URL(fileURLWithPath: upstream, isDirectory: true)
-FixtureUpstream.chunkDelay = (Double(argument("chunk-ms") ?? "0") ?? 0) / 1000
+FixtureUpstream.holdFile = argument("hold-file")
 
 let manifest = try JSONDecoder().decode(ModelManifest.self, from: Data(contentsOf: URL(fileURLWithPath: manifestPath)))
 let configuration = URLSessionConfiguration.ephemeral

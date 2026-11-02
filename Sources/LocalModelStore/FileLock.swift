@@ -22,17 +22,15 @@ package final class FileLock: Sendable {
         close(descriptor)
     }
 
-    /// `O_CLOEXEC` keeps a spawned child from holding the lock after this process dies.
+    /// `O_EXLOCK` takes the lock atomically with the open, so a sweep can never
+    /// lock a new file before its writer. `O_CLOEXEC` keeps a spawned child from
+    /// holding the lock after this process dies.
     package static func tryExclusive(at url: URL) throws -> Attempt {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let descriptor = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
-        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
-            return .acquired(FileLock(descriptor: descriptor))
-        }
+        let descriptor = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC | O_EXLOCK | O_NONBLOCK, 0o600)
+        if descriptor >= 0 { return .acquired(FileLock(descriptor: descriptor)) }
         let failure = errno
-        close(descriptor)
         switch failure {
         case EWOULDBLOCK: return .busy
         case ENOTSUP, EOPNOTSUPP: return .unsupported
@@ -41,8 +39,9 @@ package final class FileLock: Sendable {
     }
 
     /// Replaces the file's contents, which are advisory and read by waiters.
+    /// Writing first leaves no moment when a waiter sees an empty file mid-update.
     package func write(_ data: Data) {
-        guard ftruncate(descriptor, 0) == 0 else { return }
-        _ = data.withUnsafeBytes { pwrite(descriptor, $0.baseAddress, $0.count, 0) }
+        let written = data.withUnsafeBytes { pwrite(descriptor, $0.baseAddress, $0.count, 0) }
+        if written == data.count { ftruncate(descriptor, off_t(data.count)) }
     }
 }

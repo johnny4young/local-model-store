@@ -97,6 +97,10 @@ final class LocalModelStoreTests: XCTestCase {
         XCTAssertEqual(unchanged, installed)
         let inspectionsAfter = await store.fullInspectionCount
         XCTAssertEqual(inspectionsAfter, inspections, "unchanged files must not be re-hashed")
+        let forced = await lifecycle.installation(for: manifest, forceVerification: true)
+        XCTAssertEqual(forced, installed)
+        let inspectionsAfterForce = await store.fullInspectionCount
+        XCTAssertEqual(inspectionsAfterForce, inspections + 1, "a forced check must hash the files again")
 
         try Data("tampered".utf8).write(
             to: installed.directory
