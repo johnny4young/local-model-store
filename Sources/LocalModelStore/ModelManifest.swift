@@ -97,6 +97,8 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
         }
         guard Self.isSafeName(id, allowingUppercase: false) else { throw reject("id") }
         guard Self.isSafeName(revision, allowingUppercase: true) else { throw reject("revision") }
+        // An empty list would verify as installed with nothing on disk.
+        guard !artifacts.isEmpty else { throw reject("no artifacts") }
         var seen = Set<String>()
         for artifact in artifacts {
             guard artifact.hasSafePath else { throw reject("path \(artifact.path)") }
@@ -104,6 +106,13 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
             guard artifact.sizeBytes >= 0 else { throw reject("size of \(artifact.path)") }
             guard artifact.sha256.count == 64, artifact.sha256.allSatisfy(\.isLowercaseHex) else {
                 throw reject("hash of \(artifact.path)")
+            }
+        }
+        for artifact in artifacts {
+            var parent = (artifact.path.lowercased() as NSString).deletingLastPathComponent
+            while !parent.isEmpty {
+                guard !seen.contains(parent) else { throw reject("file and directory at \(parent)") }
+                parent = (parent as NSString).deletingLastPathComponent
             }
         }
     }

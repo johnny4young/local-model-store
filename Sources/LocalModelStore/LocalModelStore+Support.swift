@@ -111,14 +111,13 @@ extension LocalModelStore {
             case .irregular, .directory:
                 corrupted.append(artifact.path)
             case .regular(let fingerprint):
-                if (try? sha256(of: url)) == artifact.sha256 {
+                if fingerprint.size == Int64(artifact.sizeBytes), (try? sha256(of: url)) == artifact.sha256 {
                     hashed.append((artifact, fingerprint))
                 } else {
                     corrupted.append(artifact.path)
                 }
             }
         }
-        corrupted += unlistedEntries(of: manifest, at: base)
         afterHashing()
         for (artifact, fingerprint) in hashed {
             switch FileFingerprint.read(base.appendingPathComponent(artifact.path)) {
@@ -127,10 +126,16 @@ extension LocalModelStore {
             case .regular, .irregular, .directory: corrupted.append(artifact.path)
             }
         }
+        // Read before the fence, so an entry added after it still changes a directory's fingerprint.
+        let directories = directoryFingerprints(of: manifest, at: base)
+        corrupted += unlistedEntries(of: manifest, at: base)
         let report = VerificationReport(missing: missing, corrupted: corrupted)
-        return Inspection(report: report, fingerprints: report.isComplete ? hashed.map(\.fingerprint) : nil)
+        guard report.isComplete, let directories else { return Inspection(report: report, fingerprints: nil) }
+        return Inspection(report: report, fingerprints: hashed.map(\.fingerprint) + directories)
     }
 
+    /// Files and directories in a fixed order. Directories catch what file identity
+    /// cannot: an added entry, or a symlink swapped in for a parent.
     static func fingerprints(of manifest: ModelManifest, at base: URL) -> [FileFingerprint]? {
         var result: [FileFingerprint] = []
         for artifact in manifest.artifacts {
@@ -138,12 +143,11 @@ extension LocalModelStore {
             else { return nil }
             result.append(fingerprint)
         }
-        return result
+        guard let directories = directoryFingerprints(of: manifest, at: base) else { return nil }
+        return result + directories
     }
 
-    /// Loaders receive the whole directory, so anything the manifest does not list
-    /// makes it unverified, including a symlink in place of a directory.
-    private static func unlistedEntries(of manifest: ModelManifest, at base: URL) -> [String] {
+    private static func parentDirectories(of manifest: ModelManifest) -> Set<String> {
         var directories = Set<String>()
         for artifact in manifest.artifacts {
             var parent = (artifact.path as NSString).deletingLastPathComponent
@@ -152,12 +156,33 @@ extension LocalModelStore {
                 parent = (parent as NSString).deletingLastPathComponent
             }
         }
-        let listed = Set(manifest.artifacts.map(\.path))
+        return directories
+    }
+
+    private static func directoryFingerprints(of manifest: ModelManifest, at base: URL) -> [FileFingerprint]? {
+        var result: [FileFingerprint] = []
+        for path in [""] + parentDirectories(of: manifest).sorted() {
+            let url = path.isEmpty ? base : base.appendingPathComponent(path)
+            guard case .directory(let fingerprint) = FileFingerprint.read(url) else { return nil }
+            result.append(fingerprint)
+        }
+        return result
+    }
+
+    /// Loaders receive the whole directory, so anything the manifest does not list
+    /// makes it unverified, including a symlink in place of a directory. Names are
+    /// compared normalized, because some volumes decompose them.
+    private static func unlistedEntries(of manifest: ModelManifest, at base: URL) -> [String] {
+        let directories = Set(parentDirectories(of: manifest).map(\.precomposedStringWithCanonicalMapping))
+        let listed = Set(manifest.artifacts.map(\.path.precomposedStringWithCanonicalMapping))
         let entries = FileManager.default.subpaths(atPath: base.path) ?? []
         return entries.filter { path in
-            if listed.contains(path) || (path as NSString).lastPathComponent == ".DS_Store" { return false }
-            guard directories.contains(path) else { return true }
-            return FileFingerprint.read(base.appendingPathComponent(path)) != .directory
+            let name = path.precomposedStringWithCanonicalMapping
+            if listed.contains(name) { return false }
+            let reading = FileFingerprint.read(base.appendingPathComponent(path))
+            if directories.contains(name), case .directory = reading { return false }
+            if (name as NSString).lastPathComponent == ".DS_Store", case .regular = reading { return false }
+            return true
         }
     }
 

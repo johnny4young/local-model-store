@@ -159,7 +159,7 @@ public actor LocalModelStore {
     private func inspect(_ manifest: ModelManifest) async -> Inspection {
         guard (try? manifest.validate()) != nil else {
             return Inspection(
-                report: VerificationReport(missing: manifest.artifacts.map(\.path), corrupted: []),
+                report: VerificationReport(missing: manifest.artifacts.map(\.path), corrupted: ["invalid manifest"]),
                 fingerprints: nil)
         }
         let inspection = await inspectFiles(of: manifest, at: layout.payload(manifest.storeKey))
@@ -178,7 +178,8 @@ public actor LocalModelStore {
         lock: FileLock?,
         progress: (@Sendable (InstallEvent) -> Void)?
     ) async throws {
-        StagingDirectory.sweep(root: layout.version)
+        let version = layout.version
+        await Self.offActor { StagingDirectory.sweep(root: version) }
         let staging = try Self.storingResult("staging") { try StagingDirectory(root: layout.version) }
         defer { staging.remove() }
         let payload = staging.url.appendingPathComponent("payload", isDirectory: true)
@@ -186,12 +187,18 @@ public actor LocalModelStore {
         // The current install comes first: a repair keeps every file that still hashes clean.
         let sharedSources = localSources()
         var toFetch: [ModelArtifact] = []
+        var placedBytes = 0
         for artifact in manifest.artifacts {
             let candidates = [layout.payload(manifest.storeKey)] + seeds
             let local = candidates.map { $0.appendingPathComponent(artifact.path) }
                 + (sharedSources[artifact.sha256] ?? [])
-            let placed = try await placeLocally(artifact, in: payload, from: local)
-            if !placed { toFetch.append(artifact) }
+            if try await placeLocally(artifact, in: payload, from: local) {
+                placedBytes += artifact.sizeBytes
+                // A long copy from a slow disk must not read as a stall to waiters.
+                lock?.write(ProgressReport(completedBytes: placedBytes, totalBytes: manifest.totalSizeBytes).encoded)
+            } else {
+                toFetch.append(artifact)
+            }
         }
         try checkFreeSpace(for: toFetch)
 
@@ -217,7 +224,9 @@ public actor LocalModelStore {
         try FileManager.default.createDirectory(at: payload, withIntermediateDirectories: true)
         let information = try JSONEncoder.sorted.encode(manifest)
         try information.write(to: staging.url.appendingPathComponent("manifest.json"))
-        try Self.storing("seal") { try ModelInstaller.seal(staging.url) }
+        let sealed = staging.url
+        let sealing = await Self.offActor { Result { try ModelInstaller.seal(sealed) } }
+        try Self.storing("seal") { try sealing.get() }
 
         // The last check before the commit point: everything the manifest lists,
         // and nothing else, hashes clean.

@@ -63,6 +63,21 @@ struct ValidationTests {
         #expect(throws: LocalModelStore.LocalModelStoreError.self) { try manifest(artifacts: artifacts).validate() }
     }
 
+    @Test func anEmptyArtifactListIsRejectedAndNeverVerifies() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let empty = try manifest(artifacts: [])
+        #expect(throws: LocalModelStore.LocalModelStoreError.self) { try empty.validate() }
+        let store = try scratch.store()
+        #expect(await store.verify(empty).isComplete == false)
+        #expect(await store.verifiedInstallation(empty) == nil)
+    }
+
+    @Test func aFileThatIsAlsoADirectoryIsRejected() throws {
+        let artifacts = ["a", "a/b"].map { ModelArtifact(path: $0, sha256: Self.sha, sizeBytes: 1) }
+        #expect(throws: LocalModelStore.LocalModelStoreError.self) { try manifest(artifacts: artifacts).validate() }
+    }
+
     @Test func anEvilManifestWritesNothingAndVerifiesNothing() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
@@ -188,6 +203,25 @@ struct LocalReuseTests {
         #expect(try LocalModelStore.sha256(of: weights) == original)
     }
 
+    @Test func theLifecyclePassesSeedsToTheStore() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let seed = try seed(from: scratch)
+        let lifecycle = VerifiedModelLifecycle(store: try scratch.store()) { _ in [seed] }
+        let installation = try await lifecycle.install(scratch.manifest)
+        #expect(scratch.requests.isEmpty)
+        #expect(installation.manifestID == scratch.manifest.id)
+    }
+
+    @Test func placingFromASeedReportsProgressToWaiters() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let seed = try seed(from: scratch)
+        try await scratch.store().ensureAvailable(scratch.manifest, seeds: [seed])
+        let report = try JSONSerialization.jsonObject(with: Data(contentsOf: scratch.lockFile)) as? [String: Int]
+        #expect(report?["completedBytes"] == scratch.manifest.totalSizeBytes)
+    }
+
     @Test func aBadSeedFileIsDownloadedInstead() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
@@ -250,7 +284,9 @@ struct LocalReuseTests {
         try FileManager.default.createDirectory(at: scratch.storeRoot, withIntermediateDirectories: true)
         try FileManager.default.copyItem(at: scratch.upstream.appendingPathComponent("weights.bin"), to: secret)
         let hostile = scratch.layout.model("hostile")
-        try FileManager.default.createDirectory(at: hostile, withIntermediateDirectories: true)
+        // The payload must exist, or the path could not traverse out of it anyway.
+        try FileManager.default.createDirectory(
+            at: scratch.layout.payload("hostile"), withIntermediateDirectories: true)
         let wanted = scratch.manifest.artifacts[0]
         let evil = ModelManifest(
             id: "hostile", displayName: "x", resolveBase: scratch.manifest.resolveBase, revision: "x",
@@ -308,6 +344,39 @@ struct RepairTests {
         defer { scratch.cleanUp() }
         try Data().write(to: directory.appendingPathComponent(".DS_Store"))
         #expect(await store.verify(scratch.manifest).isComplete)
+    }
+
+    @Test func aDSStoreThatIsNotAFileIsDamage() async throws {
+        let (scratch, store, directory) = try await installed()
+        defer { scratch.cleanUp() }
+        try FileManager.default.createSymbolicLink(
+            at: directory.appendingPathComponent(".DS_Store"), withDestinationURL: scratch.root)
+        #expect(await store.verify(scratch.manifest).isComplete == false)
+    }
+
+    @Test func theFastPathNoticesAnAddedFile() async throws {
+        let (scratch, store, directory) = try await installed()
+        defer { scratch.cleanUp() }
+        #expect(await store.fingerprintIsCurrent(scratch.manifest))
+        try Data("extra".utf8).write(to: directory.appendingPathComponent("extra.bin"))
+        #expect(await store.fingerprintIsCurrent(scratch.manifest) == false)
+        #expect(await store.verifiedInstallation(scratch.manifest) == nil)
+    }
+
+    @Test func aFileOfTheWrongSizeIsCorruptedWithoutHashing() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let store = try scratch.store()
+        let directory = try await store.ensureAvailable(scratch.manifest)
+        let old = scratch.manifest
+        let mislabeled = ModelManifest(
+            id: old.id, displayName: old.displayName, resolveBase: old.resolveBase, revision: old.revision,
+            artifacts: old.artifacts.map {
+                ModelArtifact(path: $0.path, sha256: $0.sha256, sizeBytes: $0.sizeBytes + 1)
+            },
+            minimumRAMGB: 0, license: "MIT")
+        let inspection = LocalModelStore.inspectFiles(of: mislabeled, at: directory)
+        #expect(inspection.report.corrupted.sorted() == ["vocab.json", "weights.bin"])
     }
 
     @Test func aSymlinkInPlaceOfADirectoryIsNotVerified() async throws {
