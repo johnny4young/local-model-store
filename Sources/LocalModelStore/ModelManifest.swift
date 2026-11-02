@@ -7,8 +7,8 @@ public struct ModelArtifact: Codable, Sendable, Hashable {
     /// Path relative to the model's install directory (e.g.
     /// `Encoder.mlmodelc/weights/weight.bin`).
     public let path: String
-    /// SHA-256 of the file contents, lowercase hex. Verified on download and
-    /// on every load — a model file is code we execute.
+    /// SHA-256 of the file contents, lowercase hex. Checked on download and on
+    /// every store verification; a model file is code we execute.
     public let sha256: String
     public let sizeBytes: Int
 
@@ -25,8 +25,7 @@ public struct ModelArtifact: Codable, Sendable, Hashable {
 public struct ModelManifest: Codable, Sendable, Identifiable {
     public let id: String
     public let displayName: String
-    /// Directory name on disk. Must match what the inference runtime
-    /// expects (FluidAudio derives the model version from the folder name).
+    /// Directory name on disk.
     public let folderName: String
     /// Base URL each artifact path is resolved against. For Hugging Face
     /// this is `…/resolve/<commit-sha>` so the download can never drift.

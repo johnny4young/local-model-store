@@ -19,6 +19,11 @@ final class LocalModelStoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: workspace)
     }
 
+    func testStoreKeepsTheExplicitConsumer() {
+        let store = LocalModelStore(rootDirectory: workspace, consumer: .test)
+        XCTAssertEqual(store.consumer, .test)
+    }
+
     func testSHA256MatchesKnownVector() throws {
         let file = workspace.appendingPathComponent("abc.txt")
         try Data("abc".utf8).write(to: file)
