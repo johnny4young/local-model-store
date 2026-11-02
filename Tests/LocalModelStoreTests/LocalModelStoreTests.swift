@@ -2,10 +2,6 @@ import Foundation
 @testable import LocalModelStore
 import XCTest
 
-extension StoreConsumer {
-    static let test = StoreConsumer(bundleID: "com.example.test", displayName: "Test")
-}
-
 final class LocalModelStoreTests: XCTestCase {
     private var workspace: URL!
 
@@ -19,8 +15,8 @@ final class LocalModelStoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: workspace)
     }
 
-    func testStoreKeepsTheExplicitConsumer() {
-        let store = LocalModelStore(rootDirectory: workspace, consumer: .test)
+    func testStoreKeepsTheExplicitConsumer() throws {
+        let store = try LocalModelStore(location: .directory(workspace), consumer: .test)
         XCTAssertEqual(store.consumer, .test)
     }
 
@@ -35,7 +31,7 @@ final class LocalModelStoreTests: XCTestCase {
     /// End-to-end offline: "downloads" from file:// URLs, verifies, installs.
     func testEnsureAvailableDownloadsAndVerifies() async throws {
         let (manifest, _) = try makeFixtureModel()
-        let store = LocalModelStore(rootDirectory: workspace.appendingPathComponent("store"), consumer: .test)
+        let store = try LocalModelStore(location: .directory(workspace.appendingPathComponent("store")), consumer: .test)
 
         let directory = try await store.ensureAvailable(manifest)
         XCTAssertTrue(FileManager.default.fileExists(
@@ -51,12 +47,12 @@ final class LocalModelStoreTests: XCTestCase {
 
     func testVerifyDetectsMissingAndCorrupted() async throws {
         let (manifest, _) = try makeFixtureModel()
-        let store = LocalModelStore(rootDirectory: workspace.appendingPathComponent("store"), consumer: .test)
+        let store = try LocalModelStore(location: .directory(workspace.appendingPathComponent("store")), consumer: .test)
         let directory = try await store.ensureAvailable(manifest)
 
         // Corrupt one file, delete another.
         try Data("tampered".utf8).write(
-            to: directory.appendingPathComponent("bundle.mlmodelc/weights/weight.bin"))
+            to: directory.appendingPathComponent("bundle.mlmodelc/weights/weight.bin"), options: .atomic)
         try FileManager.default.removeItem(at: directory.appendingPathComponent("vocab.json"))
 
         let report = await store.verify(manifest)
@@ -82,7 +78,7 @@ final class LocalModelStoreTests: XCTestCase {
 
     func testVerifiedLifecycleCachesOnlySuccessAndSupportsExplicitReverification() async throws {
         let (manifest, _) = try makeFixtureModel()
-        let store = LocalModelStore(rootDirectory: workspace.appendingPathComponent("store"), consumer: .test)
+        let store = try LocalModelStore(location: .directory(workspace.appendingPathComponent("store")), consumer: .test)
         let lifecycle = VerifiedModelLifecycle(store: store)
 
         let missing = await lifecycle.installation(for: manifest)
@@ -104,7 +100,7 @@ final class LocalModelStoreTests: XCTestCase {
 
         try Data("tampered".utf8).write(
             to: installed.directory
-                .appendingPathComponent("bundle.mlmodelc/weights/weight.bin"))
+                .appendingPathComponent("bundle.mlmodelc/weights/weight.bin"), options: .atomic)
         let corrupted = await lifecycle.installation(for: manifest)
         XCTAssertNil(corrupted, "a changed file must drop process evidence without a forced check")
 
@@ -287,7 +283,7 @@ final class LocalModelStoreTests: XCTestCase {
         try Data(repeating: UInt8(ascii: "x"), count: original.count).write(
             to: source.appendingPathComponent("vocab.json"))
 
-        let store = LocalModelStore(rootDirectory: workspace.appendingPathComponent("store"), consumer: .test)
+        let store = try LocalModelStore(location: .directory(workspace.appendingPathComponent("store")), consumer: .test)
         do {
             _ = try await store.ensureAvailable(manifest)
             XCTFail("expected checksumMismatch")
@@ -299,7 +295,7 @@ final class LocalModelStoreTests: XCTestCase {
         }
 
         // The rejected file must not be installed.
-        let installed = await store.directory(for: manifest)
+        let installed = try await store.directory(for: manifest)
             .appendingPathComponent("vocab.json")
         XCTAssertFalse(FileManager.default.fileExists(atPath: installed.path))
     }
@@ -319,7 +315,6 @@ final class LocalModelStoreTests: XCTestCase {
         let manifest = ModelManifest(
             id: "fixture",
             displayName: "Fixture",
-            folderName: "fixture-model",
             resolveBase: source,
             revision: "test",
             artifacts: [

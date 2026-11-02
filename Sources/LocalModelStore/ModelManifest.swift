@@ -20,14 +20,26 @@ public struct ModelArtifact: Codable, Sendable, Hashable {
     }
 }
 
+extension ModelArtifact {
+    /// A relative path with no `..`, `.` or empty component, which stays inside the
+    /// directory it is joined to.
+    var hasSafePath: Bool {
+        guard !path.isEmpty, !path.hasPrefix("/"), !path.utf8.contains(0) else { return false }
+        return path.split(separator: "/", omittingEmptySubsequences: false)
+            .allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+}
+
+private extension Character {
+    var isLowercaseHex: Bool { isHexDigit && !isUppercase }
+}
+
 /// An entry in the curated model registry. Every artifact is verified
 /// against its pinned `sha256`, and `resolveBase` is pinned to an exact
 /// upstream revision — never a moving branch.
 public struct ModelManifest: Codable, Sendable, Identifiable {
     public let id: String
     public let displayName: String
-    /// Directory name on disk.
-    public let folderName: String
     /// Base URL each artifact path is resolved against. For Hugging Face
     /// this is `…/resolve/<commit-sha>` so the download can never drift.
     public let resolveBase: URL
@@ -41,7 +53,6 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
     public init(
         id: String,
         displayName: String,
-        folderName: String,
         resolveBase: URL,
         revision: String,
         artifacts: [ModelArtifact],
@@ -50,7 +61,6 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
     ) {
         self.id = id
         self.displayName = displayName
-        self.folderName = folderName
         self.resolveBase = resolveBase
         self.revision = revision
         self.artifacts = artifacts
@@ -62,14 +72,55 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
         artifacts.reduce(0) { $0 + $1.sizeBytes }
     }
 
-    /// SHA-256 over the sorted artifact list. Two manifests with the same ID and
-    /// revision can pin different files, because a revision is only informational.
+    /// SHA-256 over the artifact list, sorted by bytes so every client agrees. Two
+    /// manifests with the same ID and revision can pin different files, because a
+    /// revision is only informational.
     public var digest: String {
         let lines = artifacts
-            .map { "\($0.path)\u{0}\($0.sha256)\u{0}\($0.sizeBytes)\n" }
-            .sorted()
-            .joined()
-        return SHA256.hash(data: Data(lines.utf8)).map { String(format: "%02x", $0) }.joined()
+            .map { Array("\($0.path)\u{0}\($0.sha256)\u{0}\($0.sizeBytes)\n".utf8) }
+            .sorted { $0.lexicographicallyPrecedes($1) }
+            .flatMap { $0 }
+        return SHA256.hash(data: lines).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The directory name of an install: readable, and separate for each revision
+    /// and each set of pinned files. See `docs/FORMAT.md`.
+    var storeKey: String {
+        "\(id)@\(revision.prefix(12))-\(digest.prefix(12))"
+    }
+
+    /// Rejects anything that could reach outside a model's directory or collide on
+    /// a case-insensitive volume. A reusable package cannot assume reviewed manifests.
+    func validate() throws {
+        func reject(_ reason: String) -> LocalModelStore.LocalModelStoreError {
+            .invalidManifest(id: id, reason: reason)
+        }
+        guard Self.isSafeName(id, allowingUppercase: false) else { throw reject("id") }
+        guard Self.isSafeName(revision, allowingUppercase: true) else { throw reject("revision") }
+        var seen = Set<String>()
+        for artifact in artifacts {
+            guard artifact.hasSafePath else { throw reject("path \(artifact.path)") }
+            guard seen.insert(artifact.path.lowercased()).inserted else { throw reject("duplicate \(artifact.path)") }
+            guard artifact.sizeBytes >= 0 else { throw reject("size of \(artifact.path)") }
+            guard artifact.sha256.count == 64, artifact.sha256.allSatisfy(\.isLowercaseHex) else {
+                throw reject("hash of \(artifact.path)")
+            }
+        }
+    }
+
+    private static func isSafeName(_ name: String, allowingUppercase: Bool) -> Bool {
+        guard !name.isEmpty, name != ".", name != "..", name.count <= 128 else { return false }
+        return name.utf8.allSatisfy { byte in
+            switch byte {
+            case UInt8(ascii: "a")...UInt8(ascii: "z"), UInt8(ascii: "0")...UInt8(ascii: "9"),
+                 UInt8(ascii: "."), UInt8(ascii: "_"), UInt8(ascii: "-"):
+                return true
+            case UInt8(ascii: "A")...UInt8(ascii: "Z"):
+                return allowingUppercase
+            default:
+                return false
+            }
+        }
     }
 
     /// Identifies verification evidence. It includes the digest, because evidence

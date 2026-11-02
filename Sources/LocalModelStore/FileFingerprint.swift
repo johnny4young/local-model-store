@@ -13,8 +13,9 @@ struct FileFingerprint: Equatable, Sendable {
 
     enum Reading: Equatable, Sendable {
         case regular(FileFingerprint)
+        case directory
         case missing
-        /// A symlink, directory or other entry a manifest never describes.
+        /// A symlink or other entry a manifest never describes.
         case irregular
     }
 
@@ -23,6 +24,7 @@ struct FileFingerprint: Equatable, Sendable {
         guard lstat(url.path, &info) == 0 else {
             return errno == ENOENT || errno == ENOTDIR ? .missing : .irregular
         }
+        if info.st_mode & S_IFMT == S_IFDIR { return .directory }
         guard info.st_mode & S_IFMT == S_IFREG else { return .irregular }
         return .regular(
             FileFingerprint(

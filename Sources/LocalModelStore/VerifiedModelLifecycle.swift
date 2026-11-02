@@ -42,9 +42,7 @@ public actor VerifiedModelLifecycle {
             await store.verifiedInstallation(manifest, forceHash: true)
         }
         installModel = { manifest, progress in
-            let directory = try await store.ensureAvailable(
-                manifest,
-                progress: progress)
+            let directory = try await store.ensureAvailable(manifest, progress: progress)
             return LocalModelStore.VerifiedInstallation(
                 manifestID: manifest.id,
                 manifestRevision: manifest.revision,

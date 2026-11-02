@@ -65,8 +65,8 @@ policy.pollInterval = .milliseconds(10)
 if let stall = argument("stall-ms"), let milliseconds = Int(stall) {
     policy.stallTimeout = .milliseconds(milliseconds)
 }
-let store = LocalModelStore(
-    rootDirectory: URL(fileURLWithPath: root, isDirectory: true),
+let store = try LocalModelStore(
+    location: .directory(URL(fileURLWithPath: root, isDirectory: true)),
     consumer: StoreConsumer(bundleID: argument("consumer") ?? "com.example.client", displayName: "Client"),
     session: URLSession(configuration: configuration),
     waitPolicy: policy)

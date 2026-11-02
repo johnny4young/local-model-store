@@ -1,117 +1,51 @@
-import CryptoKit
 import Foundation
 
 /// Downloads and verifies model artifacts against the pinned registry.
 /// Nothing is ever loaded from a directory this store hasn't verified:
 /// a model file is code we execute, so integrity is not optional.
 public actor LocalModelStore {
-    public enum LocalModelStoreError: Error, LocalizedError {
-        case checksumMismatch(path: String, expected: String, actual: String)
-        case sizeMismatch(path: String, expected: Int, actual: Int)
-        case downloadFailed(path: String, underlying: String)
-        /// The disk or quota was full while downloading, staging or publishing.
-        case outOfSpace(path: String)
-        case notInstalled(missing: [String], corrupted: [String])
+    /// Room kept free beyond a download, so an install does not fill the disk.
+    private static let freeSpaceMargin: Int64 = 64 << 20
 
-        public var errorDescription: String? {
-            switch self {
-            case .checksumMismatch(let path, let expected, let actual):
-                return "sha256 mismatch for \(path): expected \(expected), got \(actual)"
-            case .sizeMismatch(let path, let expected, let actual):
-                return "size mismatch for \(path): expected \(expected) bytes, got \(actual)"
-            case .downloadFailed(let path, let underlying):
-                return "download failed for \(path): \(underlying)"
-            case .outOfSpace(let path):
-                return "not enough disk space to save \(path)"
-            case .notInstalled(let missing, let corrupted):
-                return "model not installed (missing: \(missing.count), corrupted: \(corrupted.count))"
-            }
-        }
-    }
-
-    /// Result of checking an installed model against its manifest.
-    public struct VerificationReport: Sendable {
-        public let missing: [String]
-        public let corrupted: [String]
-        public var isComplete: Bool { missing.isEmpty && corrupted.isEmpty }
-    }
-
-    /// A directory that passed the complete pinned manifest, not merely a
-    /// path that happens to contain one expected filename.
-    public struct VerifiedInstallation: Equatable, Sendable {
-        public let manifestID: String
-        public let manifestRevision: String
-        public let directory: URL
-        public let artifactBytes: Int64
-
-        init(
-            manifestID: String,
-            manifestRevision: String,
-            directory: URL,
-            artifactBytes: Int64
-        ) {
-            self.manifestID = manifestID
-            self.manifestRevision = manifestRevision
-            self.directory = directory
-            self.artifactBytes = artifactBytes
-        }
-    }
-
-    public struct DownloadProgress: Equatable, Sendable {
-        public let completedBytes: Int
-        public let totalBytes: Int
-        public let currentPath: String
-        public var fraction: Double {
-            totalBytes > 0 ? Double(completedBytes) / Double(totalBytes) : 0
-        }
-    }
-
-    /// A checksum pass or a wait is never reported as a download.
-    public enum InstallEvent: Equatable, Sendable {
-        case verifying
-        case waitingForOtherProcess(completedBytes: Int, totalBytes: Int)
-        case downloading(DownloadProgress)
-    }
-
-    /// How a waiter behaves while another process holds the install lock.
-    package struct WaitPolicy: Sendable {
-        package var pollInterval: Duration = .milliseconds(100)
-        /// A holder that reports no progress for this long is raced, never robbed:
-        /// the waiter installs on its own, and the worst outcome is wasted bytes.
-        package var stallTimeout: Duration = .seconds(120)
-
-        package init() {}
-    }
-
-    struct Inspection: Sendable {
-        let report: VerificationReport
-        /// Present only when every file hashed clean and stayed unchanged meanwhile.
-        let fingerprints: [FileFingerprint]?
-    }
-
-    private let rootDirectory: URL
+    private let layout: StoreLayout
     private let session: URLSession
     private let waitPolicy: WaitPolicy
+    private let availableCapacity: @Sendable (URL) -> Int64?
     private var verifiedFingerprints: [String: [FileFingerprint]] = [:]
     private(set) var fullInspectionCount = 0
 
     nonisolated public let consumer: StoreConsumer
 
-    /// Root and consumer are always explicit, so no caller can reach a real
-    /// store by accident.
-    public init(rootDirectory: URL, consumer: StoreConsumer, session: URLSession = .shared) {
-        self.init(rootDirectory: rootDirectory, consumer: consumer, session: session, waitPolicy: WaitPolicy())
+    /// Location and consumer are always explicit, so no caller can reach a real
+    /// store by accident. Nothing is written until an install needs it.
+    public init(location: StoreLocation, consumer: StoreConsumer, session: URLSession = .shared) throws {
+        try self.init(location: location, consumer: consumer, session: session, waitPolicy: WaitPolicy())
     }
 
-    package init(rootDirectory: URL, consumer: StoreConsumer, session: URLSession, waitPolicy: WaitPolicy) {
-        self.rootDirectory = rootDirectory
+    package init(
+        location: StoreLocation,
+        consumer: StoreConsumer,
+        session: URLSession,
+        waitPolicy: WaitPolicy,
+        availableCapacity: @escaping @Sendable (URL) -> Int64? = LocalModelStore.volumeCapacity
+    ) throws {
+        self.layout = StoreLayout(root: try location.resolvedRoot())
         self.consumer = consumer
         self.session = session
         self.waitPolicy = waitPolicy
+        self.availableCapacity = availableCapacity
     }
 
-    public func directory(for manifest: ModelManifest) -> URL {
-        rootDirectory.appendingPathComponent(manifest.folderName, isDirectory: true)
+    package static func volumeCapacity(at url: URL) -> Int64? {
+        let existing = FileManager.default.fileExists(atPath: url.path) ? url : url.deletingLastPathComponent()
+        return try? existing.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            .volumeAvailableCapacityForImportantUsage
+    }
+
+    /// The exact directory a loader receives.
+    public func directory(for manifest: ModelManifest) throws -> URL {
+        try manifest.validate()
+        return layout.payload(manifest.storeKey)
     }
 
     /// Re-hashes every artifact on disk against the manifest, away from the actor.
@@ -134,42 +68,50 @@ public actor LocalModelStore {
     /// Whether the files still match the ones last hashed clean. No file is read.
     public func fingerprintIsCurrent(_ manifest: ModelManifest) -> Bool {
         guard let expected = verifiedFingerprints[manifest.evidenceKey] else { return false }
-        return Self.fingerprints(of: manifest, at: directory(for: manifest)) == expected
+        return Self.fingerprints(of: manifest, at: layout.payload(manifest.storeKey)) == expected
     }
 
-    /// Ensures the model is installed and verified, downloading whatever is
-    /// missing or corrupted. Returns the model directory, ready to load.
-    /// Every downloaded file is hashed before it replaces anything on disk.
+    /// Ensures the model is installed and verified, placing each file from what is
+    /// already on this Mac when it can and downloading the rest. Returns the
+    /// directory to load. `seeds` are read-only directories shaped like the payload,
+    /// such as a legacy install; their bytes count only after hashing.
     @discardableResult
     public func ensureAvailable(
         _ manifest: ModelManifest,
+        seeds: [URL] = [],
         progress: (@Sendable (InstallEvent) -> Void)? = nil
     ) async throws -> URL {
-        let base = directory(for: manifest)
+        let base = try directory(for: manifest)
         progress?(.verifying)
         if await verifiedInstallation(manifest) != nil { return base }
         try Task.checkCancellation()
 
+        // The first write of an install, so the lock cannot create the root with wider permissions.
+        try Self.storing("store") { try layout.prepare() }
+
         // Nil means a stalled holder or no `flock`: installing anyway is safe,
-        // because every published file is hashed first.
+        // because publishing is atomic and every file is hashed first.
         let lock = try await acquireInstallLock(for: manifest, progress: progress)
         defer { withExtendedLifetime(lock) {} }
         // A crashed or finished holder's progress must not read as this one's.
         lock?.write(Data())
         progress?(.verifying)
-        let report = await inspect(manifest).report
-        if report.isComplete { return base }
+        if await inspect(manifest).report.isComplete { return base }
         try Task.checkCancellation()
-        try await install(report, of: manifest, lock: lock, progress: progress)
+        try await install(manifest, seeds: seeds, lock: lock, progress: progress)
         return base
     }
 
     public func remove(_ manifest: ModelManifest) throws {
-        let base = directory(for: manifest)
+        try manifest.validate()
         verifiedFingerprints[manifest.evidenceKey] = nil
-        if FileManager.default.fileExists(atPath: base.path) {
-            try FileManager.default.removeItem(at: base)
-        }
+        let model = layout.model(manifest.storeKey)
+        guard FileManager.default.fileExists(atPath: model.path) else { return }
+        // One rename takes the model away from readers; deleting it can then take its time.
+        try FileManager.default.createDirectory(at: layout.trash, withIntermediateDirectories: true)
+        let doomed = layout.trash.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.moveItem(at: model, to: doomed)
+        try FileManager.default.removeItem(at: doomed)
     }
 
     // MARK: - Internals
@@ -178,19 +120,15 @@ public actor LocalModelStore {
         VerifiedInstallation(
             manifestID: manifest.id,
             manifestRevision: manifest.revision,
-            directory: directory(for: manifest),
+            directory: layout.payload(manifest.storeKey),
             artifactBytes: Int64(manifest.totalSizeBytes))
-    }
-
-    private func installLockURL(for manifest: ModelManifest) -> URL {
-        rootDirectory.appendingPathComponent("locks/\(manifest.id)@\(manifest.revision).lock")
     }
 
     private func acquireInstallLock(
         for manifest: ModelManifest,
         progress: (@Sendable (InstallEvent) -> Void)?
     ) async throws -> FileLock? {
-        let url = installLockURL(for: manifest)
+        let url = layout.installLock(manifest.storeKey)
         let clock = ContinuousClock()
         var lastReport: Data?
         var lastChange = clock.now
@@ -219,89 +157,46 @@ public actor LocalModelStore {
     }
 
     private func inspect(_ manifest: ModelManifest) async -> Inspection {
-        fullInspectionCount += 1
-        let base = directory(for: manifest)
-        let inspection = await Self.offActor { Self.inspectFiles(of: manifest, at: base) }
+        guard (try? manifest.validate()) != nil else {
+            return Inspection(
+                report: VerificationReport(missing: manifest.artifacts.map(\.path), corrupted: []),
+                fingerprints: nil)
+        }
+        let inspection = await inspectFiles(of: manifest, at: layout.payload(manifest.storeKey))
         verifiedFingerprints[manifest.evidenceKey] = inspection.fingerprints
         return inspection
     }
 
-    /// Hashing takes seconds, so it runs away from the actor and stops when the
-    /// caller is cancelled.
-    nonisolated private static func offActor<Value: Sendable>(
-        _ work: @escaping @Sendable () -> Value
-    ) async -> Value {
-        let task = Task.detached(priority: .utility, operation: work)
-        return await withTaskCancellationHandler {
-            await task.value
-        } onCancel: {
-            task.cancel()
-        }
-    }
-
-    /// A file that changes while it is hashed does not count as verified: the open
-    /// handle would keep reading a deleted or replaced file to a clean result.
-    nonisolated static func inspectFiles(
-        of manifest: ModelManifest,
-        at base: URL,
-        afterHashing: () -> Void = {}
-    ) -> Inspection {
-        var missing: [String] = []
-        var corrupted: [String] = []
-        var hashed: [(artifact: ModelArtifact, fingerprint: FileFingerprint)] = []
-        for artifact in manifest.artifacts {
-            let url = base.appendingPathComponent(artifact.path)
-            switch FileFingerprint.read(url) {
-            case .missing:
-                missing.append(artifact.path)
-            case .irregular:
-                corrupted.append(artifact.path)
-            case .regular(let fingerprint):
-                if (try? sha256(of: url)) == artifact.sha256 {
-                    hashed.append((artifact, fingerprint))
-                } else {
-                    corrupted.append(artifact.path)
-                }
-            }
-        }
-        afterHashing()
-        for (artifact, fingerprint) in hashed {
-            switch FileFingerprint.read(base.appendingPathComponent(artifact.path)) {
-            case .regular(fingerprint): continue
-            case .missing: missing.append(artifact.path)
-            case .regular, .irregular: corrupted.append(artifact.path)
-            }
-        }
-        let report = VerificationReport(missing: missing, corrupted: corrupted)
-        return Inspection(report: report, fingerprints: report.isComplete ? hashed.map(\.fingerprint) : nil)
-    }
-
-    nonisolated private static func fingerprints(of manifest: ModelManifest, at base: URL) -> [FileFingerprint]? {
-        var result: [FileFingerprint] = []
-        for artifact in manifest.artifacts {
-            guard case .regular(let fingerprint) = FileFingerprint.read(base.appendingPathComponent(artifact.path))
-            else { return nil }
-            result.append(fingerprint)
-        }
-        return result
+    private func inspectFiles(of manifest: ModelManifest, at payload: URL) async -> Inspection {
+        fullInspectionCount += 1
+        return await Self.offActor { Self.inspectFiles(of: manifest, at: payload) }
     }
 
     private func install(
-        _ report: VerificationReport,
-        of manifest: ModelManifest,
+        _ manifest: ModelManifest,
+        seeds: [URL],
         lock: FileLock?,
         progress: (@Sendable (InstallEvent) -> Void)?
     ) async throws {
-        let base = directory(for: manifest)
-        let pending = Set(report.missing + report.corrupted)
-        let toFetch = manifest.artifacts.filter { pending.contains($0.path) }
+        StagingDirectory.sweep(root: layout.version)
+        let staging = try Self.storingResult("staging") { try StagingDirectory(root: layout.version) }
+        defer { staging.remove() }
+        let payload = staging.url.appendingPathComponent("payload", isDirectory: true)
+
+        // The current install comes first: a repair keeps every file that still hashes clean.
+        let sharedSources = localSources()
+        var toFetch: [ModelArtifact] = []
+        for artifact in manifest.artifacts {
+            let candidates = [layout.payload(manifest.storeKey)] + seeds
+            let local = candidates.map { $0.appendingPathComponent(artifact.path) }
+                + (sharedSources[artifact.sha256] ?? [])
+            let placed = try await placeLocally(artifact, in: payload, from: local)
+            if !placed { toFetch.append(artifact) }
+        }
+        try checkFreeSpace(for: toFetch)
+
         let totalBytes = toFetch.reduce(0) { $0 + $1.sizeBytes }
         var completedBytes = 0
-
-        StagingDirectory.sweep(root: rootDirectory)
-        let staging = try Self.storingResult("staging") { try StagingDirectory(root: rootDirectory) }
-        defer { staging.remove() }
-
         for artifact in toFetch {
             let completed = completedBytes
             let onBytes: @Sendable (Int) -> Void = { written in
@@ -311,29 +206,105 @@ public actor LocalModelStore {
                 lock?.write(ProgressReport(completedBytes: state.completedBytes, totalBytes: totalBytes).encoded)
             }
             onBytes(0)
-            try await fetch(artifact, of: manifest, into: base, staging: staging.url, onBytes: onBytes)
+            try await fetch(artifact, of: manifest, into: payload, staging: staging.url, onBytes: onBytes)
             completedBytes += artifact.sizeBytes
         }
-        progress?(.downloading(DownloadProgress(completedBytes: totalBytes, totalBytes: totalBytes, currentPath: "")))
-
-        // Paranoia pass: everything the manifest lists must now hash clean.
-        progress?(.verifying)
-        let final = await inspect(manifest).report
-        try Task.checkCancellation()
-        guard final.isComplete else {
-            throw LocalModelStoreError.notInstalled(missing: final.missing, corrupted: final.corrupted)
+        if !toFetch.isEmpty {
+            progress?(.downloading(
+                DownloadProgress(completedBytes: totalBytes, totalBytes: totalBytes, currentPath: "")))
         }
+
+        try FileManager.default.createDirectory(at: payload, withIntermediateDirectories: true)
+        let information = try JSONEncoder.sorted.encode(manifest)
+        try information.write(to: staging.url.appendingPathComponent("manifest.json"))
+        try Self.storing("seal") { try ModelInstaller.seal(staging.url) }
+
+        // The last check before the commit point: everything the manifest lists,
+        // and nothing else, hashes clean.
+        progress?(.verifying)
+        let final = await inspectFiles(of: manifest, at: payload)
+        try Task.checkCancellation()
+        guard final.report.isComplete else {
+            throw LocalModelStoreError.notInstalled(missing: final.report.missing, corrupted: final.report.corrupted)
+        }
+        try await commit(manifest, staging: staging.url, fingerprints: final.fingerprints)
+    }
+
+    /// Nothing after the rename can fail or be cancelled, so a published install
+    /// is always reported as one.
+    private func commit(
+        _ manifest: ModelManifest,
+        staging: URL,
+        fingerprints: [FileFingerprint]?
+    ) async throws {
+        let model = layout.model(manifest.storeKey)
+        switch try Self.storingResult("publish", { try ModelInstaller.publish(staging, as: model) }) {
+        case .published:
+            verifiedFingerprints[manifest.evidenceKey] = fingerprints
+        case .alreadyExists:
+            // Either another process just won, or this is a repair of a damaged install.
+            // Past the point of cancelling: a cancelled hash would read as damage.
+            let payload = layout.payload(manifest.storeKey)
+            let existing = await Task.detached(priority: .utility) {
+                Self.inspectFiles(of: manifest, at: payload)
+            }.value
+            if existing.report.isComplete {
+                verifiedFingerprints[manifest.evidenceKey] = existing.fingerprints
+            } else {
+                try Self.storing("publish") {
+                    try ModelInstaller.replace(model, with: staging, trash: layout.trash)
+                }
+                verifiedFingerprints[manifest.evidenceKey] = fingerprints
+            }
+        }
+    }
+
+    /// Other installs that hold a file with a given hash, as a re-pin usually does.
+    /// Their manifests are only hints: paths are checked here and bytes after cloning.
+    private func localSources() -> [String: [URL]] {
+        var sources: [String: [URL]] = [:]
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: layout.models.path)) ?? []
+        for name in names {
+            let file = layout.models.appendingPathComponent("\(name)/manifest.json")
+            guard let data = try? Data(contentsOf: file),
+                  let other = try? JSONDecoder().decode(ModelManifest.self, from: data) else { continue }
+            for artifact in other.artifacts where artifact.hasSafePath {
+                sources[artifact.sha256, default: []].append(layout.payload(name).appendingPathComponent(artifact.path))
+            }
+        }
+        return sources
+    }
+
+    /// Tries each local source in order. A source is only a hint: bad bytes are
+    /// discarded and the next one is tried.
+    private func placeLocally(_ artifact: ModelArtifact, in payload: URL, from sources: [URL]) async throws -> Bool {
+        let destination = payload.appendingPathComponent(artifact.path)
+        for source in sources {
+            try Task.checkCancellation()
+            let placement = await Self.offActor { Result { try ModelInstaller.place(from: source, to: destination) } }
+            guard try Self.storingResult(artifact.path, { try placement.get() }) == .placed else { continue }
+            let digest = try await Self.offActor { Result { try Self.sha256(of: destination) } }.get()
+            if digest == artifact.sha256 { return true }
+            try? FileManager.default.removeItem(at: destination)
+        }
+        return false
+    }
+
+    private func checkFreeSpace(for artifacts: [ModelArtifact]) throws {
+        guard let first = artifacts.first, let available = availableCapacity(layout.root) else { return }
+        let needed = artifacts.reduce(Int64(0)) { $0 + Int64($1.sizeBytes) } + Self.freeSpaceMargin
+        if available < needed { throw LocalModelStoreError.outOfSpace(path: first.path) }
     }
 
     private func fetch(
         _ artifact: ModelArtifact,
         of manifest: ModelManifest,
-        into base: URL,
+        into payload: URL,
         staging: URL,
         onBytes: @escaping @Sendable (Int) -> Void
     ) async throws {
         let source = manifest.downloadURL(for: artifact)
-        let destination = base.appendingPathComponent(artifact.path)
+        let destination = payload.appendingPathComponent(artifact.path)
         let staged = staging.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: staged) }
 
@@ -371,61 +342,8 @@ public actor LocalModelStore {
                 path: artifact.path, expected: artifact.sha256, actual: digest)
         }
 
-        // The verified file is on the destination volume, so publication is one
-        // atomic rename or replace, and a failed repair preserves the old file.
         try Task.checkCancellation()
-        try Self.storing(artifact.path) { try Self.publish(staged, at: destination) }
-    }
-
-    /// `rename` replaces a file or symlink atomically, and two writers racing with
-    /// the same verified bytes both succeed.
-    private static func publish(_ staged: URL, at destination: URL) throws {
-        guard rename(staged.path, destination.path) == 0 else {
-            throw POSIXError(.init(rawValue: errno) ?? .EIO)
-        }
-    }
-
-    /// Local writes report a full disk as `outOfSpace`; every other error passes through.
-    static func storing(_ path: String, _ write: () throws -> Void) throws {
-        try storingResult(path, write)
-    }
-
-    private static func storingResult<Result>(_ path: String, _ write: () throws -> Result) throws -> Result {
-        do {
-            return try write()
-        } catch where isOutOfSpace(error as NSError) {
-            throw LocalModelStoreError.outOfSpace(path: path)
-        }
-    }
-
-    /// Whether a disk-full or quota cause appears anywhere in the error's cause chain.
-    public static func isOutOfSpace(_ error: NSError) -> Bool {
-        if case .outOfSpace = error as? LocalModelStoreError { return true }
-        if error.domain == NSCocoaErrorDomain, error.code == NSFileWriteOutOfSpaceError {
-            return true
-        }
-        if error.domain == NSPOSIXErrorDomain,
-           error.code == Int(ENOSPC) || error.code == Int(EDQUOT) {
-            return true
-        }
-        var causes = (error.userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError]) ?? []
-        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError { causes.append(underlying) }
-        return causes.contains { isOutOfSpace($0) }
-    }
-
-    /// Streaming SHA-256 (1 MiB reads) so a 445 MB weight file never has to
-    /// fit in memory.
-    static func sha256(of url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-
-        var hasher = SHA256()
-        while true {
-            try Task.checkCancellation()
-            guard let data = try handle.read(upToCount: 1 << 20), !data.isEmpty else { break }
-            hasher.update(data: data)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        try Self.storing(artifact.path) { try FileManager.default.moveItem(at: staged, to: destination) }
     }
 }
 
@@ -436,4 +354,12 @@ private struct ProgressReport: Codable {
     let totalBytes: Int
 
     var encoded: Data { (try? JSONEncoder().encode(self)) ?? Data() }
+}
+
+private extension JSONEncoder {
+    static var sorted: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        return encoder
+    }
 }

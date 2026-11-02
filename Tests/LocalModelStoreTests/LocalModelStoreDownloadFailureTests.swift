@@ -83,12 +83,12 @@ struct LocalModelStoreDownloadFailureTests {
         let resolveBase = try #require(URL(string: "https://model-store-download-failure.invalid"))
         let manifest = ModelManifest(
             id: "download-failure-fixture", displayName: "Download failure fixture",
-            folderName: "fixture", resolveBase: resolveBase,
+            resolveBase: resolveBase,
             revision: "fixture", artifacts: [
                 ModelArtifact(path: filename, sha256: String(repeating: "0", count: 64), sizeBytes: 1)
             ],
             minimumRAMGB: 0, license: "fixture")
-        let artifact = root.appendingPathComponent(manifest.folderName).appendingPathComponent(filename)
+        let artifact = StoreLayout(root: root).payload(manifest.storeKey).appendingPathComponent(filename)
         let previousBytes = Data("Existing corrupt artifact must survive a failed repair".utf8)
         do {
             try FileManager.default.createDirectory(
@@ -101,7 +101,8 @@ struct LocalModelStoreDownloadFailureTests {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [LocalModelStoreDownloadFailureProtocol.self]
         let session = URLSession(configuration: configuration)
-        return Fixture(store: LocalModelStore(rootDirectory: root, consumer: .test, session: session), session: session,
+        let store = try LocalModelStore(location: .directory(root), consumer: .test, session: session)
+        return Fixture(store: store, session: session,
                        manifest: manifest, root: root, artifact: artifact, previousBytes: previousBytes)
     }
 }
