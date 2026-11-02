@@ -568,8 +568,11 @@ struct InstallerTests {
         try FileManager.default.createDirectory(
             at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("x".utf8).write(to: destination)
+        // Only the file fails, so a directory's flush cannot hide an ignored failure.
         #expect(throws: POSIXError.self) {
-            try ModelInstaller.seal(destination.deletingLastPathComponent()) { _ in throw POSIXError(.EIO) }
+            try ModelInstaller.seal(destination.deletingLastPathComponent()) { url in
+                if url.lastPathComponent == destination.lastPathComponent { throw POSIXError(.EIO) }
+            }
         }
     }
 
