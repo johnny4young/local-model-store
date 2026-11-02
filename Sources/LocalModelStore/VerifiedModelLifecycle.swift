@@ -2,19 +2,21 @@ import Foundation
 
 /// Process-scoped lifecycle for model installations admitted by `LocalModelStore`.
 ///
-/// Only successful full-manifest SHA-256 verification is cached. Missing or
-/// corrupt results are deliberately rechecked, and explicit install, removal,
-/// or invalidation prevents an older in-flight check from restoring stale
-/// evidence.
+/// Only successful full-manifest SHA-256 verification is cached, and only while
+/// the files keep the fingerprint they were hashed with, so another process's
+/// change is noticed. Missing or corrupt results are deliberately rechecked, and
+/// explicit install, removal, or invalidation prevents an older in-flight check
+/// from restoring stale evidence.
 public actor VerifiedModelLifecycle {
     typealias VerificationOperation = @Sendable (
         ModelManifest
     ) async -> LocalModelStore.VerifiedInstallation?
     typealias InstallationOperation = @Sendable (
         ModelManifest,
-        (@Sendable (LocalModelStore.DownloadProgress) -> Void)?
+        (@Sendable (LocalModelStore.InstallEvent) -> Void)?
     ) async throws -> LocalModelStore.VerifiedInstallation
     typealias RemovalOperation = @Sendable (ModelManifest) async throws -> Void
+    typealias CurrencyOperation = @Sendable (ModelManifest) async -> Bool
 
     private struct Verification: Sendable {
         let generation: UUID
@@ -29,6 +31,7 @@ public actor VerifiedModelLifecycle {
     private let verifyInstallation: VerificationOperation
     private let installModel: InstallationOperation
     private let removeModel: RemovalOperation
+    private let evidenceIsCurrent: CurrencyOperation
     private var verified: [String: LocalModelStore.VerifiedInstallation] = [:]
     private var verifications: [String: Verification] = [:]
     private var mutations: [String: Mutation] = [:]
@@ -50,16 +53,21 @@ public actor VerifiedModelLifecycle {
         removeModel = { manifest in
             try await store.remove(manifest)
         }
+        evidenceIsCurrent = { manifest in
+            await store.fingerprintIsCurrent(manifest)
+        }
     }
 
     init(
         verifyInstallation: @escaping VerificationOperation,
         installModel: @escaping InstallationOperation,
-        removeModel: @escaping RemovalOperation
+        removeModel: @escaping RemovalOperation,
+        evidenceIsCurrent: @escaping CurrencyOperation = { _ in true }
     ) {
         self.verifyInstallation = verifyInstallation
         self.installModel = installModel
         self.removeModel = removeModel
+        self.evidenceIsCurrent = evidenceIsCurrent
     }
 
     public func installation(
@@ -78,7 +86,11 @@ public actor VerifiedModelLifecycle {
                 continue
             }
             if !requiresVerification, let cached = verified[key] {
-                return cached
+                let current = await evidenceIsCurrent(manifest)
+                // The await may have crossed a mutation or invalidation.
+                guard verified[key] == cached, mutations[key] == nil else { continue }
+                if current { return cached }
+                verified[key] = nil
             }
 
             let verification: Verification
@@ -109,7 +121,7 @@ public actor VerifiedModelLifecycle {
 
     public func install(
         _ manifest: ModelManifest,
-        progress: (@Sendable (LocalModelStore.DownloadProgress) -> Void)? = nil
+        progress: (@Sendable (LocalModelStore.InstallEvent) -> Void)? = nil
     ) async throws -> LocalModelStore.VerifiedInstallation {
         let key = Self.key(for: manifest)
         invalidateEvidence(key: key)
