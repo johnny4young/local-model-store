@@ -189,10 +189,10 @@ public actor LocalModelStore {
         var toFetch: [ModelArtifact] = []
         var placedBytes = 0
         for artifact in manifest.artifacts {
-            let candidates = [layout.payload(manifest.storeKey)] + seeds
-            let local = candidates.map { $0.appendingPathComponent(artifact.path) }
+            let roots = [layout.payload(manifest.storeKey)] + seeds
+            let sources = roots.map { LocalSource(root: $0, path: artifact.path) }
                 + (sharedSources[artifact.sha256] ?? [])
-            if try await placeLocally(artifact, in: payload, from: local) {
+            if try await placeLocally(artifact, in: payload, from: sources) {
                 placedBytes += artifact.sizeBytes
                 // A long copy from a slow disk must not read as a stall to waiters.
                 lock?.write(ProgressReport(completedBytes: placedBytes, totalBytes: manifest.totalSizeBytes).encoded)
@@ -251,34 +251,52 @@ public actor LocalModelStore {
         case .published:
             verifiedFingerprints[manifest.evidenceKey] = fingerprints
         case .alreadyExists:
-            // Either another process just won, or this is a repair of a damaged install.
-            // Past the point of cancelling: a cancelled hash would read as damage.
-            let payload = layout.payload(manifest.storeKey)
+            try await keepOrRepair(manifest, model: model, staging: staging, fingerprints: fingerprints)
+        }
+    }
+
+    /// Either another process just won, or this is a repair of a damaged install.
+    /// Past the point of cancelling: a cancelled hash would read as damage. The
+    /// target is re-read before replacing it, so a repair that lands during the
+    /// hash is kept. Without a lock a small window remains, and both copies are verified.
+    private func keepOrRepair(
+        _ manifest: ModelManifest,
+        model: URL,
+        staging: URL,
+        fingerprints: [FileFingerprint]?
+    ) async throws {
+        let payload = layout.payload(manifest.storeKey)
+        while true {
+            let target = FileFingerprint.read(model)
             let existing = await Task.detached(priority: .utility) {
                 Self.inspectFiles(of: manifest, at: payload)
             }.value
             if existing.report.isComplete {
                 verifiedFingerprints[manifest.evidenceKey] = existing.fingerprints
-            } else {
-                try Self.storing("publish") {
-                    try ModelInstaller.replace(model, with: staging, trash: layout.trash)
-                }
-                verifiedFingerprints[manifest.evidenceKey] = fingerprints
+                return
             }
+            waitPolicy.beforeRepair?()
+            guard FileFingerprint.read(model) == target else { continue }
+            try Self.storing("publish") {
+                try ModelInstaller.replace(model, with: staging, trash: layout.trash)
+            }
+            verifiedFingerprints[manifest.evidenceKey] = fingerprints
+            return
         }
     }
 
     /// Other installs that hold a file with a given hash, as a re-pin usually does.
     /// Their manifests are only hints: paths are checked here and bytes after cloning.
-    private func localSources() -> [String: [URL]] {
-        var sources: [String: [URL]] = [:]
+    private func localSources() -> [String: [LocalSource]] {
+        var sources: [String: [LocalSource]] = [:]
         let names = (try? FileManager.default.contentsOfDirectory(atPath: layout.models.path)) ?? []
         for name in names {
             let file = layout.models.appendingPathComponent("\(name)/manifest.json")
             guard let data = try? Data(contentsOf: file),
                   let other = try? JSONDecoder().decode(ModelManifest.self, from: data) else { continue }
             for artifact in other.artifacts where artifact.hasSafePath {
-                sources[artifact.sha256, default: []].append(layout.payload(name).appendingPathComponent(artifact.path))
+                let source = LocalSource(root: layout.payload(name), path: artifact.path)
+                sources[artifact.sha256, default: []].append(source)
             }
         }
         return sources
@@ -286,11 +304,17 @@ public actor LocalModelStore {
 
     /// Tries each local source in order. A source is only a hint: bad bytes are
     /// discarded and the next one is tried.
-    private func placeLocally(_ artifact: ModelArtifact, in payload: URL, from sources: [URL]) async throws -> Bool {
+    private func placeLocally(
+        _ artifact: ModelArtifact,
+        in payload: URL,
+        from sources: [LocalSource]
+    ) async throws -> Bool {
         let destination = payload.appendingPathComponent(artifact.path)
         for source in sources {
             try Task.checkCancellation()
-            let placement = await Self.offActor { Result { try ModelInstaller.place(from: source, to: destination) } }
+            let placement = await Self.offActor {
+                Result { try ModelInstaller.place(from: source.root, path: source.path, to: destination) }
+            }
             guard try Self.storingResult(artifact.path, { try placement.get() }) == .placed else { continue }
             let digest = try await Self.offActor { Result { try Self.sha256(of: destination) } }.get()
             if digest == artifact.sha256 { return true }
@@ -354,6 +378,12 @@ public actor LocalModelStore {
         try Task.checkCancellation()
         try Self.storing(artifact.path) { try FileManager.default.moveItem(at: staged, to: destination) }
     }
+}
+
+/// A file that might already hold the bytes an install needs.
+private struct LocalSource: Sendable {
+    let root: URL
+    let path: String
 }
 
 /// What a lock holder publishes for waiters. Advisory: a torn read only delays

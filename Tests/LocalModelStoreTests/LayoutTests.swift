@@ -78,6 +78,11 @@ struct ValidationTests {
         #expect(throws: LocalModelStore.LocalModelStoreError.self) { try manifest(artifacts: artifacts).validate() }
     }
 
+    @Test func parentsThatDifferOnlyByCaseAreRejected() throws {
+        let artifacts = ["A/one.bin", "a/two.bin"].map { ModelArtifact(path: $0, sha256: Self.sha, sizeBytes: 1) }
+        #expect(throws: LocalModelStore.LocalModelStoreError.self) { try manifest(artifacts: artifacts).validate() }
+    }
+
     @Test func anEvilManifestWritesNothingAndVerifiesNothing() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
@@ -128,6 +133,15 @@ struct LayoutTests {
         #expect(try permissions(of: directory.appendingPathComponent("weights.bin")) == 0o444)
         #expect(try permissions(of: directory) == 0o755)
         #expect(scratch.stagingEntries().isEmpty)
+    }
+
+    @Test func anExistingWiderRootIsTightened() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        try FileManager.default.createDirectory(
+            at: scratch.storeRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+        try await scratch.store().ensureAvailable(scratch.manifest)
+        #expect(try permissions(of: scratch.storeRoot) == 0o700)
     }
 
     @Test func readingAStoreLeavesNothingBehind() async throws {
@@ -250,6 +264,29 @@ struct LocalReuseTests {
         #expect(scratch.requests == ["weights.bin"])
     }
 
+    @Test func aSymlinkOnTheWayToASeedFileIsNeverFollowed() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let nested = scratch.upstream.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let body = nested.appendingPathComponent("file.bin")
+        try Data(repeating: 7, count: 16).write(to: body)
+        let model = ModelManifest(
+            id: "nested", displayName: "x", resolveBase: scratch.manifest.resolveBase, revision: "x",
+            artifacts: [ModelArtifact(path: "nested/file.bin", sha256: try LocalModelStore.sha256(of: body), sizeBytes: 16)],
+            minimumRAMGB: 0, license: "x")
+        let seed = scratch.root.appendingPathComponent("seed", isDirectory: true)
+        let outside = scratch.root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: seed, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: nested, to: outside)
+        try FileManager.default.createSymbolicLink(at: seed.appendingPathComponent("nested"), withDestinationURL: outside)
+
+        let store = try scratch.store()
+        try await store.ensureAvailable(model, seeds: [seed])
+
+        #expect(scratch.requests == ["nested/file.bin"])
+    }
+
     @Test func aRepinKeepsBothInstallsAndDownloadsOnlyWhatChanged() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
@@ -339,6 +376,53 @@ struct RepairTests {
         #expect(await store.verify(scratch.manifest).isComplete)
     }
 
+    @Test func aRepairThatLandsDuringTheHashIsKept() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let writer = try scratch.store()
+        let directory = try await writer.ensureAvailable(scratch.manifest)
+        let model = directory.deletingLastPathComponent()
+        let good = scratch.root.appendingPathComponent("good", isDirectory: true)
+        try FileManager.default.copyItem(at: model, to: good)
+        let goodInode = try #require(try FileManager.default.attributesOfItem(atPath: good.path)[.systemFileNumber] as? UInt64)
+        try Data("bad".utf8).write(to: directory.appendingPathComponent("weights.bin"), options: .atomic)
+
+        // Another process repairs the model right after this one hashed it as damaged.
+        var policy = LocalModelStore.WaitPolicy()
+        policy.beforeRepair = {
+            _ = good.path.withCString { source in model.path.withCString { renamex_np(source, $0, UInt32(RENAME_SWAP)) } }
+        }
+        let store = try LocalModelStore(
+            location: .directory(scratch.storeRoot), consumer: .test, session: scratch.localSession(), waitPolicy: policy)
+        try await store.ensureAvailable(scratch.manifest)
+
+        let inode = try #require(try FileManager.default.attributesOfItem(atPath: model.path)[.systemFileNumber] as? UInt64)
+        #expect(inode == goodInode, "the other process's repair must not be replaced")
+        #expect(await store.verify(scratch.manifest).isComplete)
+    }
+
+    @Test func aDirectoryThatCannotBeListedIsNotVerified() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let nested = scratch.upstream.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let body = nested.appendingPathComponent("file.bin")
+        try Data(repeating: 9, count: 16).write(to: body)
+        let model = ModelManifest(
+            id: "unlistable", displayName: "x", resolveBase: scratch.manifest.resolveBase, revision: "x",
+            artifacts: [ModelArtifact(path: "nested/file.bin", sha256: try LocalModelStore.sha256(of: body), sizeBytes: 16)],
+            minimumRAMGB: 0, license: "x")
+        let store = try scratch.store()
+        let directory = try await store.ensureAvailable(model)
+        let listedDirectory = directory.appendingPathComponent("nested")
+
+        // Search permission lets the pinned file hash clean while hiding its neighbors.
+        #expect(chmod(listedDirectory.path, 0o311) == 0)
+        defer { chmod(listedDirectory.path, 0o755) }
+
+        #expect(await store.verify(model).corrupted == ["nested"])
+    }
+
     @Test func finderMetadataIsNotDamage() async throws {
         let (scratch, store, directory) = try await installed()
         defer { scratch.cleanUp() }
@@ -414,9 +498,9 @@ struct InstallerTests {
 
     @Test(arguments: [ENOTSUP, EXDEV])
     func cloningFallsBackToACopy(code: Int32) throws {
-        let (root, source, destination) = try scratchFiles()
+        let (root, _, destination) = try scratchFiles()
         defer { try? FileManager.default.removeItem(at: root) }
-        let result = try ModelInstaller.place(from: source, to: destination) { _, _ in
+        let result = try ModelInstaller.place(from: root, path: "source.bin", to: destination) { _, _ in
             errno = code
             return -1
         }
@@ -425,9 +509,9 @@ struct InstallerTests {
     }
 
     @Test func anotherCloneFailureMeansTheSourceIsUnavailable() throws {
-        let (root, source, destination) = try scratchFiles()
+        let (root, _, destination) = try scratchFiles()
         defer { try? FileManager.default.removeItem(at: root) }
-        let result = try ModelInstaller.place(from: source, to: destination) { _, _ in
+        let result = try ModelInstaller.place(from: root, path: "source.bin", to: destination) { _, _ in
             errno = EACCES
             return -1
         }
@@ -435,10 +519,10 @@ struct InstallerTests {
     }
 
     @Test func aFullDiskIsNotMistakenForAnUnavailableSource() throws {
-        let (root, source, destination) = try scratchFiles()
+        let (root, _, destination) = try scratchFiles()
         defer { try? FileManager.default.removeItem(at: root) }
         #expect(throws: POSIXError.self) {
-            try ModelInstaller.place(from: source, to: destination) { _, _ in
+            try ModelInstaller.place(from: root, path: "source.bin", to: destination) { _, _ in
                 errno = ENOSPC
                 return -1
             }
@@ -446,10 +530,47 @@ struct InstallerTests {
     }
 
     @Test func aRealCloneWorks() throws {
+        let (root, _, destination) = try scratchFiles()
+        defer { try? FileManager.default.removeItem(at: root) }
+        #expect(try ModelInstaller.place(from: root, path: "source.bin", to: destination) == .placed)
+        #expect(try Data(contentsOf: destination) == Data("bytes".utf8))
+    }
+
+    @Test func aSourceSwappedForASymlinkAfterTheCheckIsDiscarded() throws {
         let (root, source, destination) = try scratchFiles()
         defer { try? FileManager.default.removeItem(at: root) }
-        #expect(try ModelInstaller.place(from: source, to: destination) == .placed)
-        #expect(try Data(contentsOf: destination) == Data("bytes".utf8))
+        // The clone sees a symlink, as if the source changed right after the check.
+        let result = try ModelInstaller.place(from: root, path: "source.bin", to: destination) { _, target in
+            symlink(source.path, target)
+        }
+        #expect(result == .unavailable)
+        #expect(FileFingerprint.read(destination) == .missing)
+    }
+
+    @Test func sealingNeverTouchesASymlinkTarget() throws {
+        let (root, source, _) = try scratchFiles()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("sealed", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: directory.appendingPathComponent("link"), withDestinationURL: source)
+        #expect(chmod(source.path, 0o600) == 0)
+
+        #expect(throws: CocoaError.self) { try ModelInstaller.seal(directory) }
+
+        let mode = try #require(try FileManager.default.attributesOfItem(atPath: source.path)[.posixPermissions] as? Int)
+        #expect(mode == 0o600)
+    }
+
+    @Test func aFailedFlushFailsTheSeal() throws {
+        let (root, _, destination) = try scratchFiles()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: destination)
+        #expect(throws: POSIXError.self) {
+            try ModelInstaller.seal(destination.deletingLastPathComponent()) { _ in throw POSIXError(.EIO) }
+        }
     }
 
     @Test func publishingNeverReplacesAModel() throws {

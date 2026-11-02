@@ -83,6 +83,8 @@ extension LocalModelStore {
         /// A holder that reports no progress for this long is raced, never robbed:
         /// the waiter installs on its own, and the worst outcome is wasted bytes.
         package var stallTimeout: Duration = .seconds(120)
+        /// Runs before a repair replaces a damaged install, for tests of that race.
+        package var beforeRepair: (@Sendable () -> Void)?
 
         package init() {}
     }
@@ -175,8 +177,8 @@ extension LocalModelStore {
     private static func unlistedEntries(of manifest: ModelManifest, at base: URL) -> [String] {
         let directories = Set(parentDirectories(of: manifest).map(\.precomposedStringWithCanonicalMapping))
         let listed = Set(manifest.artifacts.map(\.path.precomposedStringWithCanonicalMapping))
-        let entries = FileManager.default.subpaths(atPath: base.path) ?? []
-        return entries.filter { path in
+        let (entries, unreadable) = listEntries(under: base)
+        return unreadable + entries.filter { path in
             let name = path.precomposedStringWithCanonicalMapping
             if listed.contains(name) { return false }
             let reading = FileFingerprint.read(base.appendingPathComponent(path))
@@ -184,6 +186,31 @@ extension LocalModelStore {
             if (name as NSString).lastPathComponent == ".DS_Store", case .regular = reading { return false }
             return true
         }
+    }
+
+    /// Every entry below `base`, without following symlinks. A directory that cannot
+    /// be read is reported, because it could hide anything.
+    private static func listEntries(under base: URL) -> (entries: [String], unreadable: [String]) {
+        var entries: [String] = []
+        var unreadable: [String] = []
+        var pending = [""]
+        while let relative = pending.popLast() {
+            let directory = relative.isEmpty ? base : base.appendingPathComponent(relative)
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
+                if !relative.isEmpty || FileFingerprint.read(base) != .missing {
+                    unreadable.append(relative.isEmpty ? "." : relative)
+                }
+                continue
+            }
+            for name in names {
+                let path = relative.isEmpty ? name : "\(relative)/\(name)"
+                entries.append(path)
+                if case .directory = FileFingerprint.read(base.appendingPathComponent(path)) {
+                    pending.append(path)
+                }
+            }
+        }
+        return (entries, unreadable)
     }
 
     /// Hashing takes seconds, so it runs away from the actor and stops when the

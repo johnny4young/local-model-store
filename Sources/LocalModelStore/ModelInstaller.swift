@@ -17,26 +17,49 @@ enum ModelInstaller {
     typealias CloneFunction = (String, String) -> Int32
 
     /// Clones a regular file, or copies it where cloning is unavailable, as on
-    /// another volume. A symlink is never followed.
+    /// another volume. No symlink is followed, at the source or on the way to it.
     static func place(
-        from source: URL,
+        from root: URL,
+        path: String,
         to destination: URL,
         clone: CloneFunction = { clonefile($0, $1, UInt32(CLONE_NOFOLLOW | CLONE_NOOWNERCOPY)) }
     ) throws -> Placement {
-        guard case .regular = FileFingerprint.read(source) else { return .unavailable }
+        let source = root.appendingPathComponent(path)
+        guard hasRealParents(path, under: root), case .regular = FileFingerprint.read(source) else {
+            return .unavailable
+        }
         try FileManager.default.createDirectory(
             at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if clone(source.path, destination.path) == 0 { return .placed }
-        let cloneFailure = errno
-        try throwIfOutOfSpace(cloneFailure)
-        guard cloneFailure == ENOTSUP || cloneFailure == EXDEV else { return .unavailable }
-        if copyfile(source.path, destination.path, nil, copyfile_flags_t(COPYFILE_DATA | COPYFILE_NOFOLLOW)) == 0 {
-            return .placed
+        if clone(source.path, destination.path) != 0 {
+            let cloneFailure = errno
+            try throwIfOutOfSpace(cloneFailure)
+            guard cloneFailure == ENOTSUP || cloneFailure == EXDEV else { return .unavailable }
+            guard copyfile(source.path, destination.path, nil, copyfile_flags_t(COPYFILE_DATA | COPYFILE_NOFOLLOW)) == 0
+            else {
+                let copyFailure = errno
+                try? FileManager.default.removeItem(at: destination)
+                try throwIfOutOfSpace(copyFailure)
+                return .unavailable
+            }
         }
-        let copyFailure = errno
-        try? FileManager.default.removeItem(at: destination)
-        try throwIfOutOfSpace(copyFailure)
-        return .unavailable
+        // The source can change after the check above, and a cloned symlink must
+        // never reach the hash or the seal, which would act on its target.
+        guard case .regular = FileFingerprint.read(destination) else {
+            try? FileManager.default.removeItem(at: destination)
+            return .unavailable
+        }
+        return .placed
+    }
+
+    /// Whether every directory between `root` and `path` is a real directory.
+    /// `root` itself may be a symlink, as when a whole store lives on another disk.
+    private static func hasRealParents(_ path: String, under root: URL) -> Bool {
+        var current = root
+        for component in path.split(separator: "/").dropLast() {
+            current.appendPathComponent(String(component))
+            guard case .directory = FileFingerprint.read(current) else { return false }
+        }
+        return true
     }
 
     private static func throwIfOutOfSpace(_ code: Int32) throws {
@@ -45,32 +68,46 @@ enum ModelInstaller {
 
     /// Makes files read-only and flushes them, so a crash right after the commit
     /// point cannot publish an install whose bytes never reached the disk.
-    static func seal(_ directory: URL) throws {
-        let keys: [URLResourceKey] = [.isDirectoryKey]
-        guard let walker = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: keys) else {
+    static func seal(_ directory: URL, flush: (URL) throws -> Void = ModelInstaller.flush) throws {
+        guard let walker = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) else {
             throw CocoaError(.fileReadUnknown)
         }
         var directories = [directory]
         for case let url as URL in walker {
-            if try url.resourceValues(forKeys: Set(keys)).isDirectory == true {
+            switch FileFingerprint.read(url) {
+            case .directory:
                 directories.append(url)
-            } else {
-                guard chmod(url.path, 0o444) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-                flush(url)
+            case .regular:
+                try setPermissions(0o444, of: url)
+                try flush(url)
+            case .irregular, .missing:
+                throw CocoaError(.fileReadUnknown)
             }
         }
         for url in directories.reversed() {
-            guard chmod(url.path, 0o755) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-            flush(url)
+            try setPermissions(0o755, of: url)
+            try flush(url)
         }
     }
 
-    private static func flush(_ url: URL) {
-        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC)
-        guard descriptor >= 0 else { return }
+    private static func setPermissions(_ mode: mode_t, of url: URL) throws {
+        guard fchmodat(AT_FDCWD, url.path, mode, AT_SYMLINK_NOFOLLOW) == 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    /// A failed flush fails the install: valid bytes in the cache prove nothing about
+    /// the disk. A volume with no barrier gets a plain `fsync` instead.
+    static func flush(_ url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         defer { close(descriptor) }
-        // Not every volume has a barrier; the hash at first use still covers it.
-        _ = fcntl(descriptor, F_BARRIERFSYNC)
+        if fcntl(descriptor, F_BARRIERFSYNC) == 0 { return }
+        let failure = errno
+        guard failure == ENOTSUP || failure == EINVAL || failure == ENOTTY else {
+            throw POSIXError(.init(rawValue: failure) ?? .EIO)
+        }
+        guard fsync(descriptor) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
     }
 
     /// The commit point. `RENAME_EXCL` makes a second publisher lose instead of

@@ -30,11 +30,11 @@ v1.noindex/                         the format version is this directory
 
 The digest exists because two clients can pin the same revision with different file lists. Without it, each would repair away the other's files.
 
-Artifact paths are relative, with no `.`, `..` or empty component, and differ by more than case.
+A manifest has at least one artifact. Artifact paths are relative, with no `.`, `..` or empty component, differ by more than case, spell each parent one way, and no path is a parent of another.
 
 ## Trust
 
-Each client hashes against values compiled into its own signed binary. `manifest.json`, directory names and everything else on disk are hints. A model is verified only when every listed file is a regular file with the pinned hash, every parent is a real directory, nothing unlisted is present except `.DS_Store`, and no file changed while it was hashed.
+Each client hashes against values compiled into its own signed binary. `manifest.json`, directory names and everything else on disk are hints. A model is verified only when every listed file is a regular file with the pinned size and hash, every parent is a real directory, every directory can be listed, nothing unlisted is present except a regular `.DS_Store`, and no file changed while it was hashed.
 
 This protects against corruption and races between cooperating clients. It is not a boundary against a malicious process running as the same user.
 
@@ -52,9 +52,9 @@ This protects against corruption and races between cooperating clients. It is no
 ## Installing
 
 1. Create and lock `staging/<uuid>.owner` atomically (`O_EXLOCK`), then create `staging/<uuid>/`.
-2. Fill `staging/<uuid>/payload/`, from these sources in order: the current install, read-only seed directories, other installs that list the same hash, then a download. Clone with `clonefile` where possible, and copy on another volume. Never follow a symlink. Hash every file, and treat a bad source as absent.
-3. Write `manifest.json`. Make files `0444` and directories `0755`, and flush with `F_BARRIERFSYNC`.
+2. Fill `staging/<uuid>/payload/`, from these sources in order: the current install, read-only seed directories, other installs that list the same hash, then a download. Clone with `clonefile` where possible, and copy on another volume. Never follow a symlink, at the source or on the way to it. Hash every file, and treat a bad source as absent.
+3. Write `manifest.json`. Make files `0444` and directories `0755`, and flush with `F_BARRIERFSYNC`, or `fsync` where there is no barrier. A failed flush fails the install.
 4. Verify the whole payload.
-5. Commit with `renamex_np(staging/<uuid>, models/<key>, RENAME_EXCL)`. If the target exists, verify it: when it is good, discard your work. When it is damaged, swap with `RENAME_SWAP` and delete the old copy.
+5. Commit with `renamex_np(staging/<uuid>, models/<key>, RENAME_EXCL)`. If the target exists, verify it: when it is good, discard your work. When it is damaged, check that it did not change during the hash, swap with `RENAME_SWAP` and delete the old copy.
 
 Any client may delete a staging directory whose owner file it can lock, then the owner file, and any staging directory with no owner file.

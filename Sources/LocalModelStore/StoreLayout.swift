@@ -16,10 +16,9 @@ struct StoreLayout: Sendable {
     /// store leaves nothing behind.
     func prepare() throws {
         let manager = FileManager.default
-        if !manager.fileExists(atPath: root.path) {
-            try manager.createDirectory(
-                at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        }
+        try manager.createDirectory(at: root, withIntermediateDirectories: true)
+        // Also when the root already exists, since another tool may have made it wider.
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         try manager.createDirectory(at: models, withIntermediateDirectories: true)
 
         // Models are pinned and can be downloaded again, so they stay out of backups.

@@ -108,10 +108,15 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
                 throw reject("hash of \(artifact.path)")
             }
         }
+        var spellings: [String: String] = [:]
         for artifact in artifacts {
-            var parent = (artifact.path.lowercased() as NSString).deletingLastPathComponent
+            var parent = (artifact.path as NSString).deletingLastPathComponent
             while !parent.isEmpty {
-                guard !seen.contains(parent) else { throw reject("file and directory at \(parent)") }
+                let folded = parent.lowercased()
+                guard !seen.contains(folded) else { throw reject("file and directory at \(parent)") }
+                // On a case-insensitive volume, A/x and a/y land in one directory.
+                guard spellings[folded, default: parent] == parent else { throw reject("case of \(parent)") }
+                spellings[folded] = parent
                 parent = (parent as NSString).deletingLastPathComponent
             }
         }
