@@ -96,6 +96,8 @@ extension LocalModelStore {
         package var beforeRepair: (@Sendable () -> Void)?
         /// Runs right after the commit point, for tests that crash there.
         package var afterPublish: (@Sendable () -> Void)?
+        /// Replaces taking the use lock, for tests of a volume with no `flock`.
+        package var useLockAttempt: (@Sendable (URL) throws -> FileLock.Attempt)?
 
         package init() {}
     }

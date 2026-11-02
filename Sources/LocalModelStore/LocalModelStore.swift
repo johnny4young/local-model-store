@@ -68,6 +68,8 @@ public actor LocalModelStore {
     /// Returns loadable installation evidence only after every pinned artifact
     /// has been hashed in this process and is unchanged since. Callers must not
     /// infer readiness from directory, filename, or byte-count checks of their own.
+    /// This says the bytes are good, not that this app may use them: another app can
+    /// have installed them, so consent stays each app's own decision.
     public func verifiedInstallation(
         _ manifest: ModelManifest,
         forceHash: Bool = false
@@ -96,7 +98,7 @@ public actor LocalModelStore {
         progress?(.verifying)
         // Without this app's claim, the slow path claims under the lock, so a
         // removal in another process cannot miss it.
-        if await verifiedInstallation(manifest) != nil, claims.exists(manifest.storeKey, consumer: consumer) {
+        if await verifiedInstallation(manifest) != nil, claims.isActive(manifest.storeKey, consumer: consumer) {
             claims.touch(manifest.storeKey, consumer: consumer)
             return base
         }
@@ -118,7 +120,7 @@ public actor LocalModelStore {
             try Task.checkCancellation()
             try await install(manifest, seeds: seeds, lock: lock, progress: progress)
         }
-        claims.write(manifest, consumer: consumer)
+        try Self.storing("claim") { try claims.write(manifest, consumer: consumer) }
         return base
     }
 
@@ -287,9 +289,20 @@ public actor LocalModelStore {
             try Self.storing("publish") {
                 try ModelInstaller.replace(model, with: staging, trash: layout.trash)
             }
+            keepOldCopyWhileLeased(manifest.storeKey, at: staging)
             verifiedFingerprints[manifest.evidenceKey] = fingerprints
             return
         }
+    }
+
+    /// A reader with a lease may hold a directory handle into the copy just replaced,
+    /// so that copy waits in the trash until the lease ends. Otherwise staging cleanup
+    /// deletes it. The key in the name tells a collection which lease to check.
+    private func keepOldCopyWhileLeased(_ key: String, at old: URL) {
+        guard case .busy? = try? FileLock.tryExclusive(at: layout.useLock(key)) else { return }
+        let kept = layout.trash.appendingPathComponent("\(key)~\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: layout.trash, withIntermediateDirectories: true)
+        try? FileManager.default.moveItem(at: old, to: kept)
     }
 
     /// Other installs that hold a file with a given hash, as a re-pin usually does.

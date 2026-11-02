@@ -10,6 +10,11 @@ package final class FileLock: Sendable {
         case busy
         /// The volume has no `flock`, as on some network homes.
         case unsupported
+
+        /// Ends the hold now, if there is one.
+        package func release() {
+            if case .acquired(let lock) = self { lock.unlock() }
+        }
     }
 
     package let descriptor: Int32
@@ -45,6 +50,11 @@ package final class FileLock: Sendable {
         case ENOTSUP, EOPNOTSUPP: return .unsupported
         default: throw POSIXError(.init(rawValue: failure) ?? .EIO)
         }
+    }
+
+    /// Ends the hold now, ahead of the descriptor closing. Safe to call twice.
+    package func unlock() {
+        flock(descriptor, LOCK_UN)
     }
 
     /// Replaces the file's contents, which are advisory and read by waiters.

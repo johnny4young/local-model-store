@@ -15,7 +15,8 @@ public actor VerifiedModelLifecycle {
         ModelManifest,
         (@Sendable (LocalModelStore.InstallEvent) -> Void)?
     ) async throws -> LocalModelStore.VerifiedInstallation
-    typealias RemovalOperation = @Sendable (ModelManifest) async throws -> Void
+    typealias RemovalOperation = @Sendable (ModelManifest, LocalModelStore.RemovalScope) async throws
+        -> LocalModelStore.RemovalOutcome
     typealias CurrencyOperation = @Sendable (ModelManifest) async -> Bool
 
     private struct Verification: Sendable {
@@ -50,8 +51,8 @@ public actor VerifiedModelLifecycle {
                 directory: directory,
                 artifactBytes: Int64(manifest.totalSizeBytes))
         }
-        removeModel = { manifest in
-            try await store.remove(manifest)
+        removeModel = { manifest, scope in
+            try await store.remove(manifest, scope: scope)
         }
         evidenceIsCurrent = { manifest in
             await store.fingerprintIsCurrent(manifest)
@@ -156,7 +157,11 @@ public actor VerifiedModelLifecycle {
         }
     }
 
-    public func remove(_ manifest: ModelManifest) async throws {
+    @discardableResult
+    public func remove(
+        _ manifest: ModelManifest,
+        scope: LocalModelStore.RemovalScope = .thisConsumer
+    ) async throws -> LocalModelStore.RemovalOutcome {
         let key = Self.key(for: manifest)
         invalidateEvidence(key: key)
         let previous = mutations[key]?.completion
@@ -166,8 +171,9 @@ public actor VerifiedModelLifecycle {
             await previous?.value
             do {
                 try Task.checkCancellation()
-                try await removeModel(manifest)
+                let outcome = try await removeModel(manifest, scope)
                 completeMutation(key: key, generation: generation)
+                return outcome
             } catch {
                 completeMutation(key: key, generation: generation)
                 throw error
@@ -177,7 +183,7 @@ public actor VerifiedModelLifecycle {
             _ = try? await task.value
         }
         mutations[key] = Mutation(generation: generation, completion: completion)
-        try await withTaskCancellationHandler {
+        return try await withTaskCancellationHandler {
             try await task.value
         } onCancel: {
             task.cancel()

@@ -33,19 +33,27 @@ extension LocalModelStore {
     public struct GarbageReport: Equatable, Sendable {
         public let removed: [String]
         public let inUse: [String]
+        /// Models that could not be deleted this time, such as for permissions.
+        public let failed: [String]
     }
 
     private var claims: ClaimStore { ClaimStore(layout: layout, now: now) }
 
-    /// Keeps a model on disk for as long as this value lives. Keep it while the model
-    /// is resident. A crash releases it, because the kernel owns the lock.
+    /// Keeps a model on disk while it is resident. Call `release()` when it unloads;
+    /// dropping the last reference and crashing also release it.
     public final class ModelLease: Sendable {
         public let directory: URL
+        /// False on a volume with no `flock`, where only claims protect a model.
+        public var isProtected: Bool { lock != nil }
         private let lock: FileLock?
 
         init(directory: URL, lock: FileLock?) {
             self.directory = directory
             self.lock = lock
+        }
+
+        public func release() {
+            lock?.unlock()
         }
     }
 
@@ -70,7 +78,7 @@ extension LocalModelStore {
         let url = layout.useLock(manifest.storeKey)
         let deadline = ContinuousClock.now + waitPolicy.leaseTimeout
         while true {
-            switch try FileLock.tryShared(at: url) {
+            switch try waitPolicy.useLockAttempt?(url) ?? FileLock.tryShared(at: url) {
             case .acquired(let lock): return lock
             case .unsupported: return nil
             case .busy:
@@ -91,6 +99,7 @@ extension LocalModelStore {
         guard FileManager.default.fileExists(atPath: layout.version.path) else { return .removed }
 
         let lock = try FileLock.tryExclusive(at: layout.installLock(key))
+        defer { withExtendedLifetime(lock) {} }
         switch scope {
         case .thisConsumer: claims.drop(key, consumer: consumer)
         case .allConsumers: claims.dropAll(key)
@@ -98,24 +107,46 @@ extension LocalModelStore {
         if case .busy = lock { return .deferred }
         let remaining = claims.live(key)
         guard remaining.isEmpty else { return .keptForOthers(remaining.map(\.displayName)) }
-        let deleted = try await deleteIfUnused(key)
-        withExtendedLifetime(lock) {}
-        return deleted ? .removed : .deferred
+        // The user asked for this, so a volume that cannot show leases does not stop it.
+        guard case .retired(let doomed) = try retire(key, ifUseIsUnknown: true) else { return .deferred }
+        lock.release()
+        await deleteBytes(doomed)
+        return .removed
     }
 
-    /// The caller holds the install lock. Returns false when a process has it leased.
-    private func deleteIfUnused(_ key: String) async throws -> Bool {
+    private enum Retirement {
+        case inUse
+        case retired(doomed: URL?)
+    }
+
+    /// Takes a model away from readers and drops its claims in one step. The caller
+    /// holds the install lock and releases it before deleting the bytes: a slow delete
+    /// holding the lock would read as a stall, and a waiter's new install could lose
+    /// its claim to a cleanup that ran later.
+    private func retire(_ key: String, ifUseIsUnknown proceed: Bool) throws -> Retirement {
         let model = layout.model(key)
-        guard FileManager.default.fileExists(atPath: model.path) else { return true }
-        let use = try FileLock.tryExclusive(at: layout.useLock(key))
-        if case .busy = use { return false }
-        // One rename takes the model away from readers; deleting it can then take its time.
+        guard FileManager.default.fileExists(atPath: model.path) else {
+            claims.dropAll(key)
+            return .retired(doomed: nil)
+        }
+        let url = layout.useLock(key)
+        let use = try waitPolicy.useLockAttempt?(url) ?? FileLock.tryExclusive(at: url)
+        switch use {
+        case .busy: return .inUse
+        case .unsupported where !proceed: return .inUse
+        case .acquired, .unsupported: break
+        }
         try FileManager.default.createDirectory(at: layout.trash, withIntermediateDirectories: true)
         let doomed = layout.trash.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.moveItem(at: model, to: doomed)
+        claims.dropAll(key)
         withExtendedLifetime(use) {}
+        return .retired(doomed: doomed)
+    }
+
+    private func deleteBytes(_ doomed: URL?) async {
+        guard let doomed else { return }
         await Self.offActor { try? FileManager.default.removeItem(at: doomed) }
-        return true
     }
 
     /// Marks this app's claims outside `manifests` as retired after an update re-pins
@@ -125,7 +156,16 @@ extension LocalModelStore {
         for manifest in manifests { try manifest.validate() }
         let kept = Set(manifests.map(\.storeKey))
         for key in claims.keys() {
-            claims.setRetired(!kept.contains(key), key: key, consumer: consumer)
+            guard kept.contains(key) else {
+                try claims.setRetired(true, key: key, consumer: consumer)
+                continue
+            }
+            guard claims.isRetired(key, consumer: consumer) else { continue }
+            let lock = try FileLock.tryExclusive(at: layout.installLock(key))
+            // Left retired if busy: the next `ensureAvailable` restores it under the lock.
+            if case .busy = lock { continue }
+            try claims.setRetired(false, key: key, consumer: consumer)
+            withExtendedLifetime(lock) {}
         }
     }
 
@@ -133,46 +173,76 @@ extension LocalModelStore {
     /// work abandoned in staging and trash. A model being installed or leased stays.
     public func collectGarbage() async throws -> GarbageReport {
         guard FileManager.default.fileExists(atPath: layout.version.path) else {
-            return GarbageReport(removed: [], inUse: [])
+            return GarbageReport(removed: [], inUse: [], failed: [])
         }
         var removed: [String] = []
         var inUse: [String] = []
+        var failed: [String] = []
         for key in modelKeys() {
-            let lock = try FileLock.tryExclusive(at: layout.installLock(key))
-            if case .busy = lock {
-                inUse.append(key)
-                continue
-            }
-            claims.dropExpired(key)
-            guard claims.live(key).isEmpty else { continue }
-            if try await deleteIfUnused(key) {
-                claims.dropAll(key)
+            // One stuck model must not block cleanup of the rest.
+            do {
+                let lock = try FileLock.tryExclusive(at: layout.installLock(key))
+                defer { withExtendedLifetime(lock) {} }
+                if case .busy = lock {
+                    inUse.append(key)
+                    continue
+                }
+                claims.dropExpired(key)
+                guard claims.live(key).isEmpty else { continue }
+                // Nobody asked for this one, so without proof of no readers it stays.
+                guard case .retired(let doomed) = try retire(key, ifUseIsUnknown: false) else {
+                    inUse.append(key)
+                    continue
+                }
+                lock.release()
+                await deleteBytes(doomed)
                 removed.append(key)
-            } else {
-                inUse.append(key)
+            } catch {
+                failed.append(key)
             }
+        }
+        dropClaimsOfMissingModels()
+        await emptyTrashAndStaging()
+        return GarbageReport(removed: removed, inUse: inUse, failed: failed)
+    }
+
+    /// Under each key's lock, so a claim from an install that just finished survives.
+    private func dropClaimsOfMissingModels() {
+        for key in claims.keys() {
+            guard !FileManager.default.fileExists(atPath: layout.model(key).path),
+                  let lock = try? FileLock.tryExclusive(at: layout.installLock(key)) else { continue }
+            if case .busy = lock { continue }
+            guard !FileManager.default.fileExists(atPath: layout.model(key).path) else { continue }
+            claims.dropAll(key)
             withExtendedLifetime(lock) {}
         }
-        let modelsLeft = Set(modelKeys())
-        for key in claims.keys() where !modelsLeft.contains(key) { claims.dropAll(key) }
+    }
+
+    private func emptyTrashAndStaging() async {
         let version = layout.version
         let trash = layout.trash
+        let layout = layout
         await Self.offActor {
             StagingDirectory.sweep(root: version)
             for name in (try? FileManager.default.contentsOfDirectory(atPath: trash.path)) ?? [] {
+                // `<key>~<uuid>` is an old copy kept for a reader. It goes once the lease ends.
+                let key = name.split(separator: "~").first.map(String.init)
+                if name.contains("~"), let key,
+                   case .busy? = try? FileLock.tryExclusive(at: layout.useLock(key)) { continue }
                 try? FileManager.default.removeItem(at: trash.appendingPathComponent(name))
             }
         }
-        return GarbageReport(removed: removed, inUse: inUse)
     }
 
     /// Reads no model bytes. Manifests on disk are hints, good enough for a list.
-    public func inventory() throws -> [InventoryEntry] {
+    public func inventory() -> [InventoryEntry] {
         modelKeys().map { key in
             let file = layout.model(key).appendingPathComponent("manifest.json")
             let manifest = (try? Data(contentsOf: file))
                 .flatMap { try? JSONDecoder().decode(ModelManifest.self, from: $0) }
             let live = claims.live(key)
+            // Two lists refreshing together can see each other here for a moment, and
+            // the next refresh corrects it.
             var isInUse = false
             if case .busy? = try? FileLock.tryExclusive(at: layout.useLock(key)) { isInUse = true }
             return InventoryEntry(
