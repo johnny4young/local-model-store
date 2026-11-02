@@ -44,11 +44,16 @@ final class StoreWatcher: Sendable {
         })
     }
 
+    /// Checks again after arming: a directory that appears while an ancestor's source
+    /// is being set up fires no event, and the watcher would stay on the ancestor.
     private func rearm() {
-        let wanted = targets()
-        let existing = state.withLock { Set($0.sources.keys) }
-        for path in existing.subtracting(wanted) { drop(path) }
-        for path in wanted.subtracting(existing) { watch(path) }
+        for _ in 0..<8 {
+            let wanted = targets()
+            let current = state.withLock { $0.isStopped ? nil : Set($0.sources.keys) }
+            guard let current, current != wanted else { return }
+            for path in current.subtracting(wanted) { drop(path) }
+            for path in wanted.subtracting(current) { watch(path) }
+        }
     }
 
     private func drop(_ path: String) {
