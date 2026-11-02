@@ -1,0 +1,263 @@
+import CryptoKit
+import Foundation
+
+/// Downloads and verifies model artifacts against the pinned registry.
+/// Nothing is ever loaded from a directory this store hasn't verified:
+/// a model file is code we execute, so integrity is not optional.
+public actor LocalModelStore {
+    public enum LocalModelStoreError: Error, LocalizedError {
+        case checksumMismatch(path: String, expected: String, actual: String)
+        case sizeMismatch(path: String, expected: Int, actual: Int)
+        case downloadFailed(path: String, underlying: String)
+        /// The disk or quota was full while downloading, staging or publishing.
+        case outOfSpace(path: String)
+        case notInstalled(missing: [String], corrupted: [String])
+
+        public var errorDescription: String? {
+            switch self {
+            case .checksumMismatch(let path, let expected, let actual):
+                return "sha256 mismatch for \(path): expected \(expected), got \(actual)"
+            case .sizeMismatch(let path, let expected, let actual):
+                return "size mismatch for \(path): expected \(expected) bytes, got \(actual)"
+            case .downloadFailed(let path, let underlying):
+                return "download failed for \(path): \(underlying)"
+            case .outOfSpace(let path):
+                return "not enough disk space to save \(path)"
+            case .notInstalled(let missing, let corrupted):
+                return "model not installed (missing: \(missing.count), corrupted: \(corrupted.count))"
+            }
+        }
+    }
+
+    /// Result of checking an installed model against its manifest.
+    public struct VerificationReport: Sendable {
+        public let missing: [String]
+        public let corrupted: [String]
+        public var isComplete: Bool { missing.isEmpty && corrupted.isEmpty }
+    }
+
+    /// A directory that passed the complete pinned manifest, not merely a
+    /// path that happens to contain one expected filename.
+    public struct VerifiedInstallation: Equatable, Sendable {
+        public let manifestID: String
+        public let manifestRevision: String
+        public let directory: URL
+        public let artifactBytes: Int64
+
+        init(
+            manifestID: String,
+            manifestRevision: String,
+            directory: URL,
+            artifactBytes: Int64
+        ) {
+            self.manifestID = manifestID
+            self.manifestRevision = manifestRevision
+            self.directory = directory
+            self.artifactBytes = artifactBytes
+        }
+    }
+
+    public struct DownloadProgress: Sendable {
+        public let completedBytes: Int
+        public let totalBytes: Int
+        public let currentPath: String
+        public var fraction: Double {
+            totalBytes > 0 ? Double(completedBytes) / Double(totalBytes) : 0
+        }
+    }
+
+    private let rootDirectory: URL
+    private let session: URLSession
+
+    nonisolated public let consumer: StoreConsumer
+
+    /// Root and consumer are always explicit, so no caller can reach a real
+    /// store by accident.
+    public init(rootDirectory: URL, consumer: StoreConsumer, session: URLSession = .shared) {
+        self.rootDirectory = rootDirectory
+        self.consumer = consumer
+        self.session = session
+    }
+
+    public func directory(for manifest: ModelManifest) -> URL {
+        rootDirectory.appendingPathComponent(manifest.folderName, isDirectory: true)
+    }
+
+    /// Re-hashes every artifact on disk against the manifest.
+    public func verify(_ manifest: ModelManifest) -> VerificationReport {
+        let base = directory(for: manifest)
+        var missing: [String] = []
+        var corrupted: [String] = []
+
+        for artifact in manifest.artifacts {
+            let url = base.appendingPathComponent(artifact.path)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                missing.append(artifact.path)
+                continue
+            }
+            do {
+                let digest = try Self.sha256(of: url)
+                if digest != artifact.sha256 {
+                    corrupted.append(artifact.path)
+                }
+            } catch {
+                corrupted.append(artifact.path)
+            }
+        }
+        return VerificationReport(missing: missing, corrupted: corrupted)
+    }
+
+    /// Returns loadable installation evidence only after every pinned artifact
+    /// has been re-hashed. Callers must not infer readiness from directory,
+    /// filename, or byte-count checks of their own.
+    public func verifiedInstallation(
+        _ manifest: ModelManifest
+    ) -> VerifiedInstallation? {
+        guard verify(manifest).isComplete else { return nil }
+        return VerifiedInstallation(
+            manifestID: manifest.id,
+            manifestRevision: manifest.revision,
+            directory: directory(for: manifest),
+            artifactBytes: Int64(manifest.totalSizeBytes))
+    }
+
+    /// Ensures the model is installed and verified, downloading whatever is
+    /// missing or corrupted. Returns the model directory, ready to load.
+    /// Every downloaded file is hashed before it replaces anything on disk.
+    @discardableResult
+    public func ensureAvailable(
+        _ manifest: ModelManifest,
+        progress: (@Sendable (DownloadProgress) -> Void)? = nil
+    ) async throws -> URL {
+        let base = directory(for: manifest)
+        let report = verify(manifest)
+        if report.isComplete { return base }
+
+        let pending = Set(report.missing + report.corrupted)
+        let toFetch = manifest.artifacts.filter { pending.contains($0.path) }
+        let totalBytes = toFetch.reduce(0) { $0 + $1.sizeBytes }
+        var completedBytes = 0
+
+        for artifact in toFetch {
+            progress?(
+                DownloadProgress(
+                    completedBytes: completedBytes, totalBytes: totalBytes,
+                    currentPath: artifact.path))
+            try await fetch(artifact, of: manifest, into: base)
+            completedBytes += artifact.sizeBytes
+        }
+        progress?(DownloadProgress(completedBytes: totalBytes, totalBytes: totalBytes, currentPath: ""))
+
+        // Paranoia pass: everything the manifest lists must now hash clean.
+        let final = verify(manifest)
+        guard final.isComplete else {
+            throw LocalModelStoreError.notInstalled(missing: final.missing, corrupted: final.corrupted)
+        }
+        return base
+    }
+
+    public func remove(_ manifest: ModelManifest) throws {
+        let base = directory(for: manifest)
+        if FileManager.default.fileExists(atPath: base.path) {
+            try FileManager.default.removeItem(at: base)
+        }
+    }
+
+    // MARK: - Internals
+
+    private func fetch(_ artifact: ModelArtifact, of manifest: ModelManifest, into base: URL) async throws {
+        let source = manifest.downloadURL(for: artifact)
+        let destination = base.appendingPathComponent(artifact.path)
+
+        let temporary: URL
+        do {
+            (temporary, _) = try await session.download(from: source)
+        } catch {
+            // URLSession also writes its temporary download to disk.
+            if Self.isOutOfSpace(error as NSError) { throw LocalModelStoreError.outOfSpace(path: artifact.path) }
+            throw LocalModelStoreError.downloadFailed(
+                path: artifact.path, underlying: String(describing: error))
+        }
+        defer { try? FileManager.default.removeItem(at: temporary) }
+
+        try Task.checkCancellation()
+        let parent = destination.deletingLastPathComponent()
+        let staged = parent.appendingPathComponent(
+            ".\(destination.lastPathComponent).download-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try Self.storing(artifact.path) {
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            do {
+                try FileManager.default.moveItem(at: temporary, to: staged)
+            } catch {
+                try? FileManager.default.removeItem(at: staged)
+                try FileManager.default.copyItem(at: temporary, to: staged)
+            }
+        }
+
+        let size = (try? FileManager.default.attributesOfItem(atPath: staged.path)[.size] as? Int) ?? -1
+        guard size == artifact.sizeBytes else {
+            throw LocalModelStoreError.sizeMismatch(
+                path: artifact.path, expected: artifact.sizeBytes, actual: size)
+        }
+
+        let digest = try Self.sha256(of: staged)
+        guard digest == artifact.sha256 else {
+            throw LocalModelStoreError.checksumMismatch(
+                path: artifact.path, expected: artifact.sha256, actual: digest)
+        }
+
+        // The verified sibling is on the destination volume, so publication is
+        // one atomic rename/replace and a failed repair preserves the old file.
+        try Task.checkCancellation()
+        try Self.storing(artifact.path) { try Self.publish(staged, at: destination) }
+    }
+
+    private static func publish(_ staged: URL, at destination: URL) throws {
+        if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(
+                destination,
+                withItemAt: staged)
+        } else {
+            try FileManager.default.moveItem(at: staged, to: destination)
+        }
+    }
+
+    /// Local writes report a full disk as `outOfSpace`; every other error passes through.
+    static func storing(_ path: String, _ write: () throws -> Void) throws {
+        do {
+            try write()
+        } catch where isOutOfSpace(error as NSError) {
+            throw LocalModelStoreError.outOfSpace(path: path)
+        }
+    }
+
+    /// Whether a disk-full or quota cause appears anywhere in the error's cause chain.
+    public static func isOutOfSpace(_ error: NSError) -> Bool {
+        if case .outOfSpace = error as? LocalModelStoreError { return true }
+        if error.domain == NSCocoaErrorDomain, error.code == NSFileWriteOutOfSpaceError {
+            return true
+        }
+        if error.domain == NSPOSIXErrorDomain,
+           error.code == Int(ENOSPC) || error.code == Int(EDQUOT) {
+            return true
+        }
+        var causes = (error.userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError]) ?? []
+        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError { causes.append(underlying) }
+        return causes.contains { isOutOfSpace($0) }
+    }
+
+    /// Streaming SHA-256 (1 MiB reads) so a 445 MB weight file never has to
+    /// fit in memory.
+    static func sha256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        while true {
+            guard let data = try handle.read(upToCount: 1 << 20), !data.isEmpty else { break }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
