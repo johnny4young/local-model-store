@@ -12,4 +12,12 @@ This package starts from a fresh git history. Each copied file is mapped to its 
 
 ## Mechanism
 
-Filled in when the store code is copied.
+Copied from an export of `johnny4young/portavoz@cffa87bb36f800108bd8e366bbaa153e2c9ec88f`, with `ModelStore` renamed to `LocalModelStore` and `ModelDescriptor` to `ModelManifest`.
+
+| Path | Portavoz path | Seam |
+|---|---|---|
+| `Sources/LocalModelStore/LocalModelStore.swift` | `Sources/ModelStoreKit/ModelStore.swift` | No default root; explicit consumer |
+| `Sources/LocalModelStore/VerifiedModelLifecycle.swift` | `Sources/ModelStoreKit/VerifiedModelLifecycle.swift` | None |
+| `Sources/LocalModelStore/ModelManifest.swift` | `Sources/ModelStoreKit/ModelRegistry.swift` | Artifact and descriptor types only; drops `tasks` and the catalog data |
+| `Tests/LocalModelStoreTests/LocalModelStoreTests.swift` | `Tests/PortavozTests/TranscriptionTests.swift` | The store test class only; drops the default-root test |
+| `Tests/LocalModelStoreTests/LocalModelStoreDownloadFailureTests.swift` | `Tests/PortavozTests/ModelStoreDownloadFailureTests.swift` | Drops the onboarding test |
