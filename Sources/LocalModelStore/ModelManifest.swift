@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// One file inside a model distribution. CoreML models ship as `.mlmodelc`
@@ -59,6 +60,22 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
 
     public var totalSizeBytes: Int {
         artifacts.reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    /// SHA-256 over the sorted artifact list. Two manifests with the same ID and
+    /// revision can pin different files, because a revision is only informational.
+    public var digest: String {
+        let lines = artifacts
+            .map { "\($0.path)\u{0}\($0.sha256)\u{0}\($0.sizeBytes)\n" }
+            .sorted()
+            .joined()
+        return SHA256.hash(data: Data(lines.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Identifies verification evidence. It includes the digest, because evidence
+    /// for one set of pins says nothing about another.
+    var evidenceKey: String {
+        "\(id)@\(revision)-\(digest)"
     }
 
     public func downloadURL(for artifact: ModelArtifact) -> URL {

@@ -90,18 +90,23 @@ final class LocalModelStoreTests: XCTestCase {
         let installed = try await lifecycle.install(manifest)
         XCTAssertEqual(installed.manifestRevision, manifest.revision)
 
+        let repeated = await lifecycle.installation(for: manifest)
+        XCTAssertEqual(repeated, installed)
+        let inspections = await store.fullInspectionCount
+        let unchanged = await lifecycle.installation(for: manifest)
+        XCTAssertEqual(unchanged, installed)
+        let inspectionsAfter = await store.fullInspectionCount
+        XCTAssertEqual(inspectionsAfter, inspections, "unchanged files must not be re-hashed")
+        let forced = await lifecycle.installation(for: manifest, forceVerification: true)
+        XCTAssertEqual(forced, installed)
+        let inspectionsAfterForce = await store.fullInspectionCount
+        XCTAssertEqual(inspectionsAfterForce, inspections + 1, "a forced check must hash the files again")
+
         try Data("tampered".utf8).write(
             to: installed.directory
                 .appendingPathComponent("bundle.mlmodelc/weights/weight.bin"))
-        let cached = await lifecycle.installation(for: manifest)
-        XCTAssertEqual(
-            cached,
-            installed,
-            "successful process evidence should avoid re-hashing on every consumer")
-        let corrupted = await lifecycle.installation(
-            for: manifest,
-            forceVerification: true)
-        XCTAssertNil(corrupted)
+        let corrupted = await lifecycle.installation(for: manifest)
+        XCTAssertNil(corrupted, "a changed file must drop process evidence without a forced check")
 
         let healed = try await lifecycle.install(manifest)
         XCTAssertEqual(healed.directory, installed.directory)

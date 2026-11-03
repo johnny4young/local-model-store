@@ -9,6 +9,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "LocalModelStore"),
-        .testTarget(name: "LocalModelStoreTests", dependencies: ["LocalModelStore"])
+        .executableTarget(name: "store-test-client", dependencies: ["LocalModelStore"], path: "Tests/StoreTestClient"),
+        .testTarget(name: "LocalModelStoreTests", dependencies: ["LocalModelStore", "store-test-client"])
     ]
 )
