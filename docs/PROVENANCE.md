@@ -16,8 +16,8 @@ Copied from an export of `johnny4young/portavoz@cffa87bb36f800108bd8e366bbaa153e
 
 | Path | Portavoz path | Seam |
 |---|---|---|
-| `Sources/LocalModelStore/LocalModelStore.swift` | `Sources/ModelStoreKit/ModelStore.swift` | No default root; explicit consumer |
+| `Sources/LocalModelStore/LocalModelStore.swift`, `LocalModelStore+Support.swift` | `Sources/ModelStoreKit/ModelStore.swift` | No default root, explicit consumer, whole-model publication |
 | `Sources/LocalModelStore/VerifiedModelLifecycle.swift` | `Sources/ModelStoreKit/VerifiedModelLifecycle.swift` | None |
-| `Sources/LocalModelStore/ModelManifest.swift` | `Sources/ModelStoreKit/ModelRegistry.swift` | Artifact and descriptor types only; drops `tasks` and the catalog data |
+| `Sources/LocalModelStore/ModelManifest.swift` | `Sources/ModelStoreKit/ModelRegistry.swift` | Artifact and descriptor types only; drops `tasks`, `folderName` and the catalog data |
 | `Tests/LocalModelStoreTests/LocalModelStoreTests.swift` | `Tests/PortavozTests/TranscriptionTests.swift` | The store test class only; drops the default-root test |
 | `Tests/LocalModelStoreTests/LocalModelStoreDownloadFailureTests.swift` | `Tests/PortavozTests/ModelStoreDownloadFailureTests.swift` | Drops the onboarding test |

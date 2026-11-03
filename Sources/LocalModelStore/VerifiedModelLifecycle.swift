@@ -36,15 +36,14 @@ public actor VerifiedModelLifecycle {
     private var verifications: [String: Verification] = [:]
     private var mutations: [String: Mutation] = [:]
 
-    public init(store: LocalModelStore) {
+    /// `seeds` names read-only directories to reuse for a manifest, such as a legacy install.
+    public init(store: LocalModelStore, seeds: @escaping @Sendable (ModelManifest) -> [URL] = { _ in [] }) {
         verifyInstallation = { manifest in
             // This actor owns the fast path, so reaching the store always means a full hash.
             await store.verifiedInstallation(manifest, forceHash: true)
         }
         installModel = { manifest, progress in
-            let directory = try await store.ensureAvailable(
-                manifest,
-                progress: progress)
+            let directory = try await store.ensureAvailable(manifest, seeds: seeds(manifest), progress: progress)
             return LocalModelStore.VerifiedInstallation(
                 manifestID: manifest.id,
                 manifestRevision: manifest.revision,

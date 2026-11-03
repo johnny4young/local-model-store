@@ -3,127 +3,6 @@ import Foundation
 import os
 import Testing
 
-/// A scratch store plus a fixture upstream and manifest. Never touches a real store.
-private struct Scratch {
-    let root: URL
-    let upstream: URL
-    let manifest: ModelManifest
-    let manifestFile: URL
-    let log: URL
-    let storeRoot: URL
-    let holdFile: URL
-
-    init(artifactBytes: Int = 4096) throws {
-        root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("local-model-store-concurrency-\(UUID().uuidString)", isDirectory: true)
-        upstream = root.appendingPathComponent("upstream", isDirectory: true)
-        storeRoot = root.appendingPathComponent("store", isDirectory: true)
-        log = root.appendingPathComponent("events.log")
-        manifestFile = root.appendingPathComponent("manifest.json")
-        holdFile = root.appendingPathComponent("release-upstream")
-        try FileManager.default.createDirectory(at: upstream, withIntermediateDirectories: true)
-
-        var artifacts: [ModelArtifact] = []
-        for name in ["weights.bin", "vocab.json"] {
-            let file = upstream.appendingPathComponent(name)
-            try Data(repeating: 0x5A, count: artifactBytes).write(to: file)
-            artifacts.append(
-                ModelArtifact(path: name, sha256: try LocalModelStore.sha256(of: file), sizeBytes: artifactBytes))
-        }
-        manifest = ModelManifest(
-            id: "fixture",
-            displayName: "Fixture",
-            folderName: "fixture",
-            // A host per scratch keeps parallel tests from reading each other's files.
-            resolveBase: try #require(URL(string: "https://\(UUID().uuidString).invalid")),
-            revision: "rev1",
-            artifacts: artifacts,
-            minimumRAMGB: 0,
-            license: "MIT")
-        try JSONEncoder().encode(manifest).write(to: manifestFile)
-    }
-
-    func cleanUp() {
-        try? FileManager.default.removeItem(at: root)
-    }
-
-    /// A store in this process that downloads from this scratch's upstream.
-    func store() -> LocalModelStore {
-        if let host = manifest.resolveBase.host { LocalUpstream.register(upstream, host: host) }
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [LocalUpstream.self]
-        return LocalModelStore(
-            rootDirectory: storeRoot, consumer: .test, session: URLSession(configuration: configuration))
-    }
-
-    var events: [String] {
-        ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
-    }
-
-    func downloads(of name: String) -> Int {
-        events.filter { $0.hasPrefix("download /\(name) ") }.count
-    }
-
-    func releaseUpstream() throws {
-        try Data().write(to: holdFile)
-    }
-
-    func client(held: Bool = false, stallMilliseconds: Int? = nil) throws -> Process {
-        let process = Process()
-        process.executableURL = try clientExecutable()
-        var arguments = [
-            "--root", storeRoot.path, "--manifest", manifestFile.path, "--upstream", upstream.path,
-            "--log", log.path
-        ]
-        if held { arguments += ["--hold-file", holdFile.path] }
-        if let stallMilliseconds { arguments += ["--stall-ms", String(stallMilliseconds)] }
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        try process.run()
-        return process
-    }
-
-    func waitForEvent(prefix: String, timeout: Duration = .seconds(30)) async throws {
-        let deadline = ContinuousClock.now + timeout
-        while !events.contains(where: { $0.hasPrefix(prefix) }) {
-            guard ContinuousClock.now < deadline else {
-                Issue.record("No event starting with \(prefix): \(events)")
-                return
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-    }
-
-    func stagingEntries() -> [String] {
-        (try? FileManager.default.contentsOfDirectory(atPath: storeRoot.appendingPathComponent("staging").path)) ?? []
-    }
-}
-
-private final class BundleAnchor {}
-
-private func clientExecutable() throws -> URL {
-    let products = Bundle(for: BundleAnchor.self).bundleURL.deletingLastPathComponent()
-    let url = products.appendingPathComponent("store-test-client")
-    try #require(FileManager.default.isExecutableFile(atPath: url.path), "missing \(url.path)")
-    return url
-}
-
-private func finish(_ process: Process) async {
-    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-        DispatchQueue.global().async {
-            process.waitUntilExit()
-            continuation.resume()
-        }
-    }
-}
-
-/// Collects events synchronously, so their order is the order they were emitted.
-private final class Events: Sendable {
-    private let state = OSAllocatedUnfairLock<[LocalModelStore.InstallEvent]>(initialState: [])
-    var all: [LocalModelStore.InstallEvent] { state.withLock { $0 } }
-    func add(_ event: LocalModelStore.InstallEvent) { state.withLock { $0.append(event) } }
-}
-
 struct MultiprocessInstallTests {
     @Test func twoProcessesDownloadOnceAndBothSucceed() async throws {
         let scratch = try Scratch()
@@ -158,9 +37,7 @@ struct MultiprocessInstallTests {
         await finish(next)
         #expect(next.terminationStatus == 0)
         #expect(scratch.stagingEntries().isEmpty, "the next install sweeps abandoned work")
-        #expect(FileManager.default.fileExists(
-            atPath: scratch.storeRoot.appendingPathComponent("locks/fixture@rev1.lock").path),
-            "lock files are never deleted")
+        #expect(FileManager.default.fileExists(atPath: scratch.lockFile.path), "lock files are never deleted")
     }
 
     @Test func aStalledHolderIsRacedAndTheInstallStaysCorrect() async throws {
@@ -169,17 +46,20 @@ struct MultiprocessInstallTests {
         let stalled = try scratch.client(held: true)
         try await scratch.waitForEvent(prefix: "download ")
         kill(stalled.processIdentifier, SIGSTOP)
-        defer {
-            kill(stalled.processIdentifier, SIGKILL)
-            stalled.waitUntilExit()
-        }
 
         let waiter = try scratch.client(stallMilliseconds: 200)
         await finish(waiter)
         #expect(waiter.terminationStatus == 0, "\(scratch.events)")
         #expect(scratch.events.contains { $0.hasPrefix("waiting ") })
 
-        let store = LocalModelStore(rootDirectory: scratch.storeRoot, consumer: .test)
+        // The holder wakes up after losing: it must find the install and succeed.
+        try scratch.releaseUpstream()
+        kill(stalled.processIdentifier, SIGCONT)
+        await finish(stalled)
+        #expect(stalled.terminationStatus == 0, "\(scratch.events)")
+        #expect(scratch.stagingEntries().isEmpty)
+
+        let store = try LocalModelStore(location: .directory(scratch.storeRoot), consumer: .test)
         #expect(await store.verify(scratch.manifest).isComplete)
     }
 }
@@ -188,7 +68,7 @@ struct InstallLockTests {
     @Test func cancellingAWaitDownloadsNothingAndLeavesNoWork() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let url = scratch.storeRoot.appendingPathComponent("locks/fixture@rev1.lock")
+        let url = scratch.lockFile
         guard case .acquired(let holder) = try FileLock.tryExclusive(at: url) else {
             Issue.record("The test must hold the lock")
             return
@@ -196,8 +76,8 @@ struct InstallLockTests {
         let events = Events()
         var policy = LocalModelStore.WaitPolicy()
         policy.pollInterval = .milliseconds(5)
-        let store = LocalModelStore(
-            rootDirectory: scratch.storeRoot, consumer: .test, session: .shared, waitPolicy: policy)
+        let store = try LocalModelStore(
+            location: .directory(scratch.storeRoot), consumer: .test, session: .shared, waitPolicy: policy)
         let manifest = scratch.manifest
         let install = Task {
             try await store.ensureAvailable(manifest) { events.add($0) }
@@ -240,11 +120,11 @@ struct InstallLockTests {
     @Test func aNewHolderClearsAFinishedHoldersProgress() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let url = scratch.storeRoot.appendingPathComponent("locks/fixture@rev1.lock")
+        let url = scratch.lockFile
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(#"{"completedBytes":99,"totalBytes":100}"#.utf8).write(to: url)
         let contents = OSAllocatedUnfairLock<[Data]>(initialState: [])
-        let store = scratch.store()
+        let store = try scratch.store()
         try await store.ensureAvailable(scratch.manifest) { event in
             guard case .verifying = event, let data = try? Data(contentsOf: url) else { return }
             contents.withLock { $0.append(data) }
@@ -273,7 +153,7 @@ struct InstallLockTests {
 struct FingerprintTests {
     private func installed() async throws -> (Scratch, LocalModelStore, URL) {
         let scratch = try Scratch()
-        let store = scratch.store()
+        let store = try scratch.store()
         let directory = try await store.ensureAvailable(scratch.manifest)
         return (scratch, store, directory)
     }
@@ -292,9 +172,11 @@ struct FingerprintTests {
         #expect(lstat(file.path, &before) == 0)
         var bytes = try Data(contentsOf: file)
         bytes[0] ^= 0xFF
+        #expect(chmod(file.path, 0o644) == 0)
         let handle = try FileHandle(forWritingTo: file)
         try handle.write(contentsOf: bytes)
         try handle.close()
+        #expect(chmod(file.path, 0o444) == 0)
         let times = [before.st_atimespec, before.st_mtimespec]
         #expect(utimensat(AT_FDCWD, file.path, times, 0) == 0)
         var after = stat()
@@ -324,8 +206,8 @@ struct FingerprintTests {
         defer { scratch.cleanUp() }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [RateLimitedUpstream.self]
-        let store = LocalModelStore(
-            rootDirectory: scratch.storeRoot, consumer: .test, session: URLSession(configuration: configuration))
+        let store = try LocalModelStore(
+            location: .directory(scratch.storeRoot), consumer: .test, session: URLSession(configuration: configuration))
         do {
             try await store.ensureAvailable(scratch.manifest)
             Issue.record("A 429 must fail the install")
@@ -347,8 +229,8 @@ struct FingerprintTests {
         let server = try await LoopbackServer(root: scratch.upstream, pause: .milliseconds(800))
         defer { server.stop() }
         let manifest = scratch.manifest.served(from: try #require(URL(string: "http://127.0.0.1:\(server.port)")))
-        let store = LocalModelStore(
-            rootDirectory: scratch.storeRoot, consumer: .test, session: URLSession(configuration: .ephemeral))
+        let store = try LocalModelStore(
+            location: .directory(scratch.storeRoot), consumer: .test, session: URLSession(configuration: .ephemeral))
 
         let events = Events()
         try await store.ensureAvailable(manifest) { events.add($0) }
@@ -371,8 +253,8 @@ struct FingerprintTests {
         let server = try await LoopbackServer(root: scratch.upstream, pause: .seconds(60))
         defer { server.stop() }
         let manifest = scratch.manifest.served(from: try #require(URL(string: "http://127.0.0.1:\(server.port)")))
-        let store = LocalModelStore(
-            rootDirectory: scratch.storeRoot, consumer: .test, session: URLSession(configuration: .ephemeral))
+        let store = try LocalModelStore(
+            location: .directory(scratch.storeRoot), consumer: .test, session: URLSession(configuration: .ephemeral))
 
         let events = Events()
         let install = Task { try await store.ensureAvailable(manifest) { events.add($0) } }
@@ -389,7 +271,7 @@ struct FingerprintTests {
     @Test func cancellingDuringTheFinalPassIsNotReportedAsCorruption() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let store = scratch.store()
+        let store = try scratch.store()
         let manifest = scratch.manifest
         let install = Task {
             try await store.ensureAvailable(manifest) { event in
@@ -409,7 +291,6 @@ struct FingerprintTests {
         let repinned = ModelManifest(
             id: original.id,
             displayName: original.displayName,
-            folderName: original.folderName,
             resolveBase: original.resolveBase,
             revision: original.revision,
             artifacts: original.artifacts.map {
@@ -464,47 +345,5 @@ struct FingerprintTests {
 
         #expect(await store.verify(scratch.manifest).isComplete)
         #expect(!FileManager.default.fileExists(atPath: scratch.root.appendingPathComponent("does-not-exist").path))
-    }
-}
-
-private final class LocalUpstream: URLProtocol, @unchecked Sendable {
-    private static let directories = OSAllocatedUnfairLock<[String: URL]>(initialState: [:])
-
-    static func register(_ directory: URL, host: String) {
-        directories.withLock { $0[host] = directory }
-    }
-
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func stopLoading() {}
-
-    override func startLoading() {
-        guard let url = request.url, let client else { return }
-        let directory = url.host.flatMap { host in Self.directories.withLock { $0[host] } }
-        guard let data = directory.flatMap({ try? Data(contentsOf: $0.appendingPathComponent(url.lastPathComponent)) }),
-              let response = HTTPURLResponse(
-                url: url, statusCode: 200, httpVersion: nil,
-                headerFields: ["Content-Length": String(data.count)]) else {
-            client.urlProtocol(self, didFailWithError: URLError(.fileDoesNotExist))
-            return
-        }
-        client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client.urlProtocol(self, didLoad: data.prefix(data.count / 2))
-        client.urlProtocol(self, didLoad: data.suffix(from: data.count / 2))
-        client.urlProtocolDidFinishLoading(self)
-    }
-}
-
-private final class RateLimitedUpstream: URLProtocol, @unchecked Sendable {
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func stopLoading() {}
-
-    override func startLoading() {
-        guard let url = request.url, let client,
-              let response = HTTPURLResponse(url: url, statusCode: 429, httpVersion: nil, headerFields: nil) else { return }
-        client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client.urlProtocol(self, didLoad: Data("Too many requests".utf8))
-        client.urlProtocolDidFinishLoading(self)
     }
 }

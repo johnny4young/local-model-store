@@ -5,7 +5,7 @@ import Network
 extension ModelManifest {
     func served(from base: URL) -> ModelManifest {
         ModelManifest(
-            id: id, displayName: displayName, folderName: folderName, resolveBase: base, revision: revision,
+            id: id, displayName: displayName, resolveBase: base, revision: revision,
             artifacts: artifacts, minimumRAMGB: minimumRAMGB, license: license)
     }
 }
