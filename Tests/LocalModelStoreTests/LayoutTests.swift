@@ -83,6 +83,11 @@ struct ValidationTests {
         #expect(throws: LocalModelStore.LocalModelStoreError.self) { try manifest(artifacts: artifacts).validate() }
     }
 
+    @Test func aTotalSizeThatWouldOverflowIsRejected() throws {
+        let artifacts = ["a", "b"].map { ModelArtifact(path: $0, sha256: Self.sha, sizeBytes: .max / 2) }
+        #expect(throws: LocalModelStore.LocalModelStoreError.self) { try manifest(artifacts: artifacts).validate() }
+    }
+
     @Test func anEvilManifestWritesNothingAndVerifiesNothing() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }

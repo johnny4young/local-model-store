@@ -12,7 +12,9 @@ v1.noindex/                         the format version is this directory
   models/<key>/
     manifest.json                   informational
     payload/                        what a loader receives; files 0444, directories 0755
-  locks/<key>.lock
+  claims/<key>/<bundle-id>.json     declares that an app needs a model
+  locks/<key>.lock                  serializes installs
+  locks/<key>.use                   shared while a process has the model loaded
   staging/<uuid>/
   staging/<uuid>.owner
   trash/<uuid>/
@@ -58,3 +60,45 @@ This protects against corruption and races between cooperating clients. It is no
 5. Commit with `renamex_np(staging/<uuid>, models/<key>, RENAME_EXCL)`. If the target exists, verify it: when it is good, discard your work. When it is damaged, check that it did not change during the hash, swap with `RENAME_SWAP` and delete the old copy.
 
 Any client may delete a staging directory whose owner file it can lock, then the owner file, and any staging directory with no owner file.
+
+## Claims
+
+`claims/<key>/<bundle-id>.json` declares that an app needs a model. Release and Dev builds are separate consumers, each under its own bundle ID. Claims are declarative rather than counted, because a crash or a drag to the Trash would leak a count.
+
+```json
+{
+  "consumer": "com.example.app",
+  "displayName": "App",
+  "firstClaimedAt": "2026-11-02T12:00:00Z",
+  "lastUsedAt": "2026-11-02T12:00:00Z",
+  "retiredAt": null
+}
+```
+
+- Dates are RFC 3339 without fractional seconds. Ignore unknown keys. A file that does not decode still protects the model.
+- Write with an atomic rename, at most once a day for `lastUsedAt`, and touch `claims/` afterward so watchers notice.
+- Create or restore a claim only while holding the install lock, so a removal or a collection cannot miss it. Refreshing or retiring an existing claim needs no lock.
+- When an update stops pinning a model, set `retiredAt`. A retired claim still protects the model for 14 days, so a rollback downloads nothing. Clear it, under the install lock, as soon as the model is used again.
+- A claim is not consent. Each app asks before its own first use of a model.
+
+## Leases
+
+`locks/<key>.use` is held with `flock(LOCK_SH)` while a process has the model loaded. Take it before verifying. A deleter must get `LOCK_EX`. The kernel releases it when the holder dies.
+
+On a volume with no `flock`, a lease protects nothing and says so. There, only an explicit removal deletes a model, and a collection leaves it alone.
+
+A repair that replaces a model while its use lock is held moves the old copy to `trash/<key>~<uuid>` instead of deleting it, because a reader may hold a directory handle into it. A collection deletes that copy once `LOCK_EX` succeeds.
+
+## Removing
+
+1. Try the install lock without waiting, and drop the claims being removed.
+2. If the install lock is busy, or live claims remain, stop. The bytes stay.
+3. Try `LOCK_EX` on the use lock without waiting. If it is busy, stop, and a later collection finishes the job.
+4. Rename `models/<key>` into `trash/<uuid>` while holding it, and drop every claim left for the key.
+5. Release the install lock, then delete the bytes. A slow delete holding the lock would read as a stall.
+
+A collection does this for every real directory in `models/` with no live claims. It also drops retired claims past their grace, drops claims for models that no longer exist while holding that key's install lock, and empties `trash/` and abandoned `staging/`. A symlink in `models/` is never a model.
+
+## Uninstalling
+
+The root is never part of an app's Homebrew `zap`, because removing one app must not cost another a download.

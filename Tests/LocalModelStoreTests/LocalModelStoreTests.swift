@@ -132,7 +132,7 @@ final class LocalModelStoreTests: XCTestCase {
                 return nil
             },
             installModel: { _, _ in evidence },
-            removeModel: { _ in })
+            removeModel: { _, _ in .removed })
 
         let request = Task {
             await lifecycle.installation(
@@ -174,7 +174,7 @@ final class LocalModelStoreTests: XCTestCase {
                 return nil
             },
             installModel: { _, _ in obsoleteEvidence },
-            removeModel: { _ in })
+            removeModel: { _, _ in .removed })
 
         let first = Task {
             await lifecycle.installation(
@@ -222,8 +222,9 @@ final class LocalModelStoreTests: XCTestCase {
                 await events.add("install-end")
                 return evidence
             },
-            removeModel: { _ in
+            removeModel: { _, _ in
                 await events.add("remove")
+                return .removed
             })
 
         let install = Task { try await lifecycle.install(manifest) }
@@ -235,7 +236,7 @@ final class LocalModelStoreTests: XCTestCase {
 
         await releaseInstall.open()
         _ = try await install.value
-        try await remove.value
+        _ = try await remove.value
 
         let finalEvents = await events.events
         XCTAssertEqual(finalEvents, ["install-start", "install-end", "remove"])
@@ -259,7 +260,7 @@ final class LocalModelStoreTests: XCTestCase {
                 await releaseCommittedInstall.wait()
                 return evidence
             },
-            removeModel: { _ in })
+            removeModel: { _, _ in .removed })
 
         let install = Task { try await lifecycle.install(manifest) }
         await installStarted.wait()

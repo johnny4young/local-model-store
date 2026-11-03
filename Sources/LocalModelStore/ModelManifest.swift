@@ -68,8 +68,12 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
         self.license = license
     }
 
+    /// Saturates, because manifests read from disk are untrusted and an overflow would trap.
     public var totalSizeBytes: Int {
-        artifacts.reduce(0) { $0 + $1.sizeBytes }
+        artifacts.reduce(0) { total, artifact in
+            let (sum, overflow) = total.addingReportingOverflow(max(artifact.sizeBytes, 0))
+            return overflow ? .max : sum
+        }
     }
 
     /// SHA-256 over the artifact list, sorted by bytes so every client agrees. Two
@@ -99,6 +103,8 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
         guard Self.isSafeName(revision, allowingUppercase: true) else { throw reject("revision") }
         // An empty list would verify as installed with nothing on disk.
         guard !artifacts.isEmpty else { throw reject("no artifacts") }
+        // Past this, space checks would overflow. No model is close to it.
+        guard totalSizeBytes < Int.max / 2 else { throw reject("total size") }
         var seen = Set<String>()
         for artifact in artifacts {
             guard artifact.hasSafePath else { throw reject("path \(artifact.path)") }
@@ -108,14 +114,23 @@ public struct ModelManifest: Codable, Sendable, Identifiable {
                 throw reject("hash of \(artifact.path)")
             }
         }
+        try validateParents(listedPaths: seen)
+    }
+
+    private func validateParents(listedPaths: Set<String>) throws {
         var spellings: [String: String] = [:]
         for artifact in artifacts {
             var parent = (artifact.path as NSString).deletingLastPathComponent
             while !parent.isEmpty {
                 let folded = parent.lowercased()
-                guard !seen.contains(folded) else { throw reject("file and directory at \(parent)") }
+                guard !listedPaths.contains(folded) else {
+                    throw LocalModelStore.LocalModelStoreError.invalidManifest(
+                        id: id, reason: "file and directory at \(parent)")
+                }
                 // On a case-insensitive volume, A/x and a/y land in one directory.
-                guard spellings[folded, default: parent] == parent else { throw reject("case of \(parent)") }
+                guard spellings[folded, default: parent] == parent else {
+                    throw LocalModelStore.LocalModelStoreError.invalidManifest(id: id, reason: "case of \(parent)")
+                }
                 spellings[folded] = parent
                 parent = (parent as NSString).deletingLastPathComponent
             }

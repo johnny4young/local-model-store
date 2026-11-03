@@ -51,7 +51,7 @@ final class FixtureUpstream: URLProtocol, @unchecked Sendable {
 }
 
 guard let root = argument("root"), let manifestPath = argument("manifest"), let upstream = argument("upstream") else {
-    fatalError("usage: store-test-client --root R --manifest M --upstream U [--log L] [--hold-file F] [--stall-ms N]")
+    fatalError("usage: store-test-client --root R --manifest M --upstream U [--log L] [--hold-file F] [--stall-ms N] [--consumer C] [--hold-lease] [--crash-after-publish]")
 }
 FixtureUpstream.directory = URL(fileURLWithPath: upstream, isDirectory: true)
 FixtureUpstream.holdFile = argument("hold-file")
@@ -65,6 +65,9 @@ policy.pollInterval = .milliseconds(10)
 if let stall = argument("stall-ms"), let milliseconds = Int(stall) {
     policy.stallTimeout = .milliseconds(milliseconds)
 }
+if CommandLine.arguments.contains("--crash-after-publish") {
+    policy.afterPublish = { _exit(9) }
+}
 let store = try LocalModelStore(
     location: .directory(URL(fileURLWithPath: root, isDirectory: true)),
     consumer: StoreConsumer(bundleID: argument("consumer") ?? "com.example.client", displayName: "Client"),
@@ -77,6 +80,13 @@ do {
     }
     log("installed \(getpid())")
     print(directory.path)
+    if CommandLine.arguments.contains("--hold-lease") {
+        let lease = try await store.lease(manifest)
+        log("leased \(getpid())")
+        withExtendedLifetime(lease) {
+            while true { sleep(60) }
+        }
+    }
 } catch {
     log("failed \(getpid()) \(error)")
     exit(1)
