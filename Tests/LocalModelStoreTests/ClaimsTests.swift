@@ -7,12 +7,6 @@ private let release = StoreConsumer(bundleID: "com.example.app", displayName: "A
 private let dev = StoreConsumer(bundleID: "com.example.app.dev", displayName: "App Dev")
 private let other = StoreConsumer(bundleID: "com.example.other", displayName: "Other")
 
-private final class TestClock: Sendable {
-    private let date = OSAllocatedUnfairLock(initialState: Date(timeIntervalSince1970: 1_800_000_000))
-    var now: Date { date.withLock { $0 } }
-    func advance(days: Double) { date.withLock { $0 += days * 24 * 60 * 60 } }
-}
-
 private extension Scratch {
     func store(
         _ consumer: StoreConsumer,
@@ -666,11 +660,9 @@ struct AcceptanceTests {
     func aStoreAndItsSeedsWorkAcrossVolumes(fileSystem: String) async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let image = scratch.root.appendingPathComponent("volume.dmg")
-        let mount = scratch.root.appendingPathComponent("mount", isDirectory: true)
-        try run("/usr/bin/hdiutil", "create", "-quiet", "-size", "128m", "-fs", fileSystem, "-volname", "LMSTest", image.path)
-        try run("/usr/bin/hdiutil", "attach", "-quiet", "-nobrowse", "-noautoopen", "-mountpoint", mount.path, image.path)
-        defer { try? run("/usr/bin/hdiutil", "detach", "-quiet", "-force", mount.path) }
+        let volume = try ScratchVolume(fileSystem: fileSystem, in: scratch.root)
+        defer { volume.detach() }
+        let mount = volume.mount
 
         // The store is on the other volume, and the seed is on this one.
         let storeRoot = mount.appendingPathComponent("store", isDirectory: true)
@@ -699,14 +691,5 @@ struct AcceptanceTests {
         try await local.ensureAvailable(scratch.manifest, seeds: [outsideSeed])
         #expect(scratch.requests.count == before)
         #expect(await local.verify(scratch.manifest).isComplete)
-    }
-
-    private func run(_ tool: String, _ arguments: String...) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: tool)
-        process.arguments = arguments
-        try process.run()
-        process.waitUntilExit()
-        try #require(process.terminationStatus == 0, "\(tool) \(arguments)")
     }
 }

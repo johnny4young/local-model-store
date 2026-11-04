@@ -18,11 +18,13 @@ func log(_ line: String) {
 }
 
 /// Serves artifact bytes from a directory and logs each request. With a hold
-/// file, it serves nothing until that file exists, so a test decides the timing.
+/// file, it serves nothing until that file exists, or only that one name with
+/// `--hold-only`, so a test decides the timing.
 final class FixtureUpstream: URLProtocol, @unchecked Sendable {
     // Read-only after launch; URLProtocol instances are created by URLSession.
     nonisolated(unsafe) static var directory = URL(fileURLWithPath: "/")
     nonisolated(unsafe) static var holdFile: String?
+    nonisolated(unsafe) static var holdOnly: String?
     private let queue = DispatchQueue(label: "fixture-upstream")
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -39,7 +41,8 @@ final class FixtureUpstream: URLProtocol, @unchecked Sendable {
         }
         client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         queue.async { [self] in
-            while let hold = Self.holdFile, !FileManager.default.fileExists(atPath: hold) {
+            while let hold = Self.holdFile, Self.holdOnly == nil || Self.holdOnly == url.lastPathComponent,
+                  !FileManager.default.fileExists(atPath: hold) {
                 Thread.sleep(forTimeInterval: 0.01)
             }
             client.urlProtocol(self, didLoad: data)
@@ -51,10 +54,11 @@ final class FixtureUpstream: URLProtocol, @unchecked Sendable {
 }
 
 guard let root = argument("root"), let manifestPath = argument("manifest"), let upstream = argument("upstream") else {
-    fatalError("usage: store-test-client --root R --manifest M --upstream U [--log L] [--hold-file F] [--stall-ms N] [--consumer C] [--hold-lease] [--crash-after-publish]")
+    fatalError("usage: store-test-client --root R --manifest M --upstream U [--log L] [--hold-file F] [--hold-only NAME] [--stall-ms N] [--consumer C] [--hold-lease] [--crash-after-publish]")
 }
 FixtureUpstream.directory = URL(fileURLWithPath: upstream, isDirectory: true)
 FixtureUpstream.holdFile = argument("hold-file")
+FixtureUpstream.holdOnly = argument("hold-only")
 
 let manifest = try JSONDecoder().decode(ModelManifest.self, from: Data(contentsOf: URL(fileURLWithPath: manifestPath)))
 let configuration = URLSessionConfiguration.ephemeral

@@ -8,7 +8,18 @@ struct StoreLayout: Sendable {
     var models: URL { version.appendingPathComponent("models", isDirectory: true) }
     var trash: URL { version.appendingPathComponent("trash", isDirectory: true) }
     var claims: URL { version.appendingPathComponent("claims", isDirectory: true) }
+    var partials: URL { version.appendingPathComponent("partial", isDirectory: true) }
 
+    /// False for a symlink or a file there, so nothing is read or deleted through it.
+    var partialsAreReal: Bool {
+        if case .directory = FileFingerprint.read(partials) { return true }
+        return false
+    }
+
+    func partial(_ key: String) -> URL { partials.appendingPathComponent(key, isDirectory: true) }
+    /// Relative to `version`, so checking its parents covers `partial/` as well.
+    /// By hash, so no manifest path decides where a kept file lands.
+    func keptPath(_ artifact: ModelArtifact, key: String) -> String { "partial/\(key)/\(artifact.sha256)" }
     func model(_ key: String) -> URL { models.appendingPathComponent(key, isDirectory: true) }
     func payload(_ key: String) -> URL { model(key).appendingPathComponent("payload", isDirectory: true) }
     func installLock(_ key: String) -> URL { version.appendingPathComponent("locks/\(key).lock") }

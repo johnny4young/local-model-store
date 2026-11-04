@@ -17,6 +17,7 @@ v1.noindex/                         the format version is this directory
   locks/<key>.use                   shared while a process has the model loaded
   staging/<uuid>/
   staging/<uuid>.owner
+  partial/<key>/<sha256>            a verified download kept for the next attempt
   trash/<uuid>/
 ```
 
@@ -54,12 +55,24 @@ This protects against corruption and races between cooperating clients. It is no
 ## Installing
 
 1. Create and lock `staging/<uuid>.owner` atomically (`O_EXLOCK`), then create `staging/<uuid>/`.
-2. Fill `staging/<uuid>/payload/`, from these sources in order: the current install, read-only seed directories, other installs that list the same hash, then a download. Clone with `clonefile` where possible, and copy on another volume. Never follow a symlink, at the source or on the way to it. Hash every file, and treat a bad source as absent.
+2. Fill `staging/<uuid>/payload/`, from these sources in order: the current install, `partial/<key>/`, read-only seed directories, other installs that list the same hash, then a download. Keep each download that hashes clean as described under [Kept downloads](#kept-downloads). Clone with `clonefile` where possible, and copy on another volume. Never follow a symlink, at the source or on the way to it. Hash every file, and treat a bad source as absent.
 3. Write `manifest.json`. Make files `0444` and directories `0755`, and flush with `F_BARRIERFSYNC`, or `fsync` where there is no barrier. A failed flush fails the install.
 4. Verify the whole payload.
 5. Commit with `renamex_np(staging/<uuid>, models/<key>, RENAME_EXCL)`. If the target exists, verify it: when it is good, discard your work. When it is damaged, check that it did not change during the hash, swap with `RENAME_SWAP` and delete the old copy.
 
 Any client may delete a staging directory whose owner file it can lock, then the owner file, and any staging directory with no owner file.
+
+## Kept downloads
+
+`partial/<key>/<sha256>` holds a download that already hashed clean, so a dropped network or a cancel resumes at the next file. It is a hint like any other source: hash it before use, delete it when it fails, and never read, write or delete through a symlink in place of `partial/` or `partial/<key>`.
+
+- Write it during an install, only as a clone of the verified file, so it costs no space. An install racing a stalled holder or on a volume with no `flock` writes it with no lock, which hashing keeps safe. A volume without clones keeps nothing, and an interrupted install starts over there. A failure to keep a file does not fail the install.
+- Set the modification time of `partial/<key>/` when an install starts.
+- Once the model is verified, delete `partial/<key>/` while holding the install lock, unless the install is already racing without it. If the lock is busy, leave the directory for later.
+- Delete it when a removal or a collection retires the model.
+- A collection also renames `partial/<key>/` into `trash/` when the install lock is free and, read while holding it, the directory has not changed for 14 days. An existing claim does not protect it.
+
+A client that does not know this directory ignores it, so the format version does not change.
 
 ## Claims
 
@@ -97,7 +110,7 @@ A repair that replaces a model while its use lock is held moves the old copy to 
 4. Rename `models/<key>` into `trash/<uuid>` while holding it, and drop every claim left for the key.
 5. Release the install lock, then delete the bytes. A slow delete holding the lock would read as a stall.
 
-A collection does this for every real directory in `models/` with no live claims. It also drops retired claims past their grace, drops claims for models that no longer exist while holding that key's install lock, and empties `trash/` and abandoned `staging/`. A symlink in `models/` is never a model.
+A collection does this for every real directory in `models/` with no live claims. It also drops retired claims and kept downloads past their grace, drops claims for models that no longer exist while holding that key's install lock, and empties `trash/` and abandoned `staging/`. A symlink in `models/` is never a model.
 
 ## Uninstalling
 

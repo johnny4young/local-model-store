@@ -51,6 +51,28 @@ enum ModelInstaller {
         return .placed
     }
 
+    /// Saves a verified file for a later attempt. Only as a clone, which costs no space,
+    /// so keeping files never fills a disk that had room for the install. A volume
+    /// without clones keeps nothing, and a failure here never fails the install.
+    static func keep(_ file: URL, under root: URL, path: String) {
+        var parent = root
+        for component in path.split(separator: "/").dropLast() {
+            parent.appendPathComponent(String(component))
+            switch FileFingerprint.read(parent) {
+            case .directory, .missing: continue
+            case .regular, .irregular: return
+            }
+        }
+        try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let destination = root.appendingPathComponent(path)
+        _ = clonefile(file.path, destination.path, UInt32(CLONE_NOFOLLOW | CLONE_NOOWNERCOPY))
+    }
+
+    static func discardKept(_ path: String, under root: URL) {
+        guard hasRealParents(path, under: root) else { return }
+        try? FileManager.default.removeItem(at: root.appendingPathComponent(path))
+    }
+
     /// Whether every directory between `root` and `path` is a real directory.
     /// `root` itself may be a symlink, as when a whole store lives on another disk.
     private static func hasRealParents(_ path: String, under root: URL) -> Bool {
