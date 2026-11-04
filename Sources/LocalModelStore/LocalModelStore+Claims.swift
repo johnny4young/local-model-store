@@ -148,9 +148,12 @@ extension LocalModelStore {
 
     /// Renamed away under the lock, like a model, so deleting it never holds the lock.
     private func retirePartial(_ key: String) -> URL? {
+        let partial = layout.partial(key)
+        guard layout.partialsAreReal, FileFingerprint.read(partial) != .missing else { return nil }
         let doomed = layout.trash.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: layout.trash, withIntermediateDirectories: true)
-        return (try? FileManager.default.moveItem(at: layout.partial(key), to: doomed)) == nil ? nil : doomed
+        guard (try? FileManager.default.moveItem(at: partial, to: doomed)) != nil else { return nil }
+        return doomed
     }
 
     private func deleteBytes(_ doomed: URL?) async {
@@ -204,8 +207,10 @@ extension LocalModelStore {
                     inUse.append(key)
                     continue
                 }
+                let partial = retirePartial(key)
                 lock.release()
                 await deleteBytes(doomed)
+                await deleteBytes(partial)
                 removed.append(key)
             } catch {
                 failed.append(key)
@@ -220,13 +225,15 @@ extension LocalModelStore {
     /// By age alone: an install claims only after it succeeds, so a claim says nothing
     /// about kept files. An unknown lock proceeds, because the grace already outlasts any attempt.
     private func collectPartials() async {
+        guard layout.partialsAreReal else { return }
         let names = (try? FileManager.default.contentsOfDirectory(atPath: layout.partials.path)) ?? []
         for key in names {
+            guard let lock = try? FileLock.tryExclusive(at: layout.installLock(key)) else { continue }
+            if case .busy = lock { continue }
+            // Read under the lock, because an install refreshes the time while holding it.
             let path = layout.partial(key).path
             guard let touched = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
-                  now().timeIntervalSince(touched) >= ClaimStore.retiredGrace,
-                  let lock = try? FileLock.tryExclusive(at: layout.installLock(key)) else { continue }
-            if case .busy = lock { continue }
+                  now().timeIntervalSince(touched) >= ClaimStore.retiredGrace else { continue }
             let doomed = retirePartial(key)
             lock.release()
             await deleteBytes(doomed)

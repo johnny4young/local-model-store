@@ -123,13 +123,41 @@ private func clientExecutable() throws -> URL {
     return url
 }
 
-func run(_ tool: String, _ arguments: String...) throws {
+private func run(_ tool: String, _ arguments: String...) throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: tool)
     process.arguments = arguments
     try process.run()
     process.waitUntilExit()
     try #require(process.terminationStatus == 0, "\(tool) \(arguments)")
+}
+
+/// A real volume from a disk image, for file systems with no `clonefile` and,
+/// as on exFAT, no `RENAME_EXCL` or `RENAME_SWAP`.
+struct ScratchVolume {
+    let mount: URL
+
+    init(fileSystem: String, in root: URL) throws {
+        let image = root.appendingPathComponent("volume.dmg")
+        mount = root.appendingPathComponent("mount", isDirectory: true)
+        try run("/usr/bin/hdiutil", "create", "-quiet", "-size", "128m", "-fs", fileSystem, "-volname", "LMSTest", image.path)
+        try run("/usr/bin/hdiutil", "attach", "-quiet", "-nobrowse", "-noautoopen", "-mountpoint", mount.path, image.path)
+    }
+
+    func detach() {
+        try? run("/usr/bin/hdiutil", "detach", "-quiet", "-force", mount.path)
+    }
+}
+
+final class TestClock: Sendable {
+    private let date: OSAllocatedUnfairLock<Date>
+    var now: Date { date.withLock { $0 } }
+
+    init(start: Date = Date(timeIntervalSince1970: 1_800_000_000)) {
+        date = OSAllocatedUnfairLock(initialState: start)
+    }
+
+    func advance(days: Double) { date.withLock { $0 += days * 24 * 60 * 60 } }
 }
 
 func finish(_ process: Process) async {
@@ -156,6 +184,10 @@ class LocalUpstream: URLProtocol, @unchecked Sendable {
         seen.withLock { $0[host] ?? [] }
     }
 
+    static func record(_ url: URL) {
+        if let host = url.host { seen.withLock { $0[host, default: []].append(String(url.path.dropFirst())) } }
+    }
+
     static func register(_ directory: URL, host: String) {
         directories.withLock { $0[host] = directory }
     }
@@ -166,7 +198,7 @@ class LocalUpstream: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         guard let url = request.url, let client else { return }
-        if let host = url.host { Self.seen.withLock { $0[host, default: []].append(String(url.path.dropFirst())) } }
+        Self.record(url)
         let directory = url.host.flatMap { host in Self.directories.withLock { $0[host] } }
         guard let data = directory.flatMap({ try? Data(contentsOf: $0.appendingPathComponent(String(url.path.dropFirst()))) }),
               let response = HTTPURLResponse(

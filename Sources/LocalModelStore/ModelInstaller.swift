@@ -55,15 +55,16 @@ enum ModelInstaller {
     /// so keeping files never fills a disk that had room for the install. A volume
     /// without clones keeps nothing, and a failure here never fails the install.
     static func keep(_ file: URL, under root: URL, path: String) {
-        let destination = root.appendingPathComponent(path)
-        let parent = destination.deletingLastPathComponent()
-        for directory in [root, parent] {
-            switch FileFingerprint.read(directory) {
+        var parent = root
+        for component in path.split(separator: "/").dropLast() {
+            parent.appendPathComponent(String(component))
+            switch FileFingerprint.read(parent) {
             case .directory, .missing: continue
             case .regular, .irregular: return
             }
         }
         try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let destination = root.appendingPathComponent(path)
         _ = clonefile(file.path, destination.path, UInt32(CLONE_NOFOLLOW | CLONE_NOOWNERCOPY))
     }
 

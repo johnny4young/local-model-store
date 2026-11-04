@@ -64,12 +64,12 @@ Any client may delete a staging directory whose owner file it can lock, then the
 
 ## Kept downloads
 
-`partial/<key>/<sha256>` holds a download that already hashed clean, so a dropped network or a cancel resumes at the next file. It is a hint like any other source: hash it before use, delete it when it fails, and never follow a symlink in place of `partial/<key>`.
+`partial/<key>/<sha256>` holds a download that already hashed clean, so a dropped network or a cancel resumes at the next file. It is a hint like any other source: hash it before use, delete it when it fails, and never read, write or delete through a symlink in place of `partial/` or `partial/<key>`.
 
-- Write it while holding the install lock, only as a clone of the verified file, so it costs no space. A volume without clones keeps nothing, and an interrupted install starts over there. A failure to keep a file does not fail the install.
+- Write it during an install, only as a clone of the verified file, so it costs no space. An install racing a stalled holder or on a volume with no `flock` writes it with no lock, which hashing keeps safe. A volume without clones keeps nothing, and an interrupted install starts over there. A failure to keep a file does not fail the install.
 - Set the modification time of `partial/<key>/` when an install starts.
-- Delete `partial/<key>/` once the model is verified, and when a removal retires the model.
-- A collection renames `partial/<key>/` into `trash/` when it has not changed for 14 days and the install lock is free. An existing claim does not protect it.
+- Delete `partial/<key>/` once the model is verified, and when a removal or a collection retires the model.
+- A collection also renames `partial/<key>/` into `trash/` when the install lock is free and, read while holding it, the directory has not changed for 14 days. An existing claim does not protect it.
 
 A client that does not know this directory ignores it, so the format version does not change.
 

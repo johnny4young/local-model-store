@@ -1,20 +1,18 @@
 import Foundation
 @testable import LocalModelStore
-import os
 import Testing
 
 private let other = StoreConsumer(bundleID: "com.example.other", displayName: "Other")
 
-private final class TestClock: Sendable {
-    private let date = OSAllocatedUnfairLock(initialState: Date())
-    var now: Date { date.withLock { $0 } }
-    func advance(days: Double) { date.withLock { $0 += days * 24 * 60 * 60 } }
-}
-
 /// Answers every file except the last one, which never finishes, like a dropped connection.
+/// It adds no state to `LocalUpstream`, which guards its own.
 private final class StallingUpstream: LocalUpstream, @unchecked Sendable {
     override func startLoading() {
-        if request.url?.lastPathComponent != "vocab.json" { super.startLoading() }
+        guard let url = request.url, url.lastPathComponent == "vocab.json" else {
+            super.startLoading()
+            return
+        }
+        Self.record(url)
     }
 }
 
@@ -79,15 +77,50 @@ struct PartialResumeTests {
 
         let install = Task { try await stalling.ensureAvailable(scratch.manifest) }
         let deadline = ContinuousClock.now + .seconds(30)
-        while !scratch.exists(scratch.kept(scratch.weights)), ContinuousClock.now < deadline {
+        while !scratch.requests.contains(scratch.vocab.path), ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
+        try #require(scratch.requests.contains(scratch.vocab.path), "the second transfer is running")
         install.cancel()
-        await #expect(throws: (any Error).self) { try await install.value }
+        await #expect(throws: CancellationError.self) { try await install.value }
         let attempted = scratch.requests.count
         try await scratch.store().ensureAvailable(scratch.manifest)
 
         #expect(scratch.requestsAfter(attempted) == [scratch.vocab.path])
+    }
+
+    @Test func aKilledProcessResumesAtTheNextFile() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let holder = try scratch.client(held: true, extra: ["--hold-only", scratch.vocab.path])
+        try await scratch.waitForEvent(prefix: "download /\(scratch.vocab.path) ")
+        kill(holder.processIdentifier, SIGKILL)
+        await finish(holder)
+
+        let next = try scratch.client()
+        await finish(next)
+
+        #expect(next.terminationStatus == 0, "\(scratch.events)")
+        #expect(scratch.downloads(of: scratch.weights.path) == 1)
+        #expect(scratch.downloads(of: scratch.vocab.path) == 2)
+        #expect(!scratch.exists(scratch.partialDirectory))
+    }
+
+    @Test func aResumedInstallReportsProgressOfTheWholeModel() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let store = try scratch.store()
+        try await scratch.dropAfterFirstFile(store)
+        let events = Events()
+
+        try await store.ensureAvailable(scratch.manifest) { events.add($0) }
+
+        let reports = events.all.compactMap { event -> LocalModelStore.DownloadProgress? in
+            if case .downloading(let progress) = event { progress } else { nil }
+        }
+        #expect(reports.first?.completedBytes == scratch.weights.sizeBytes)
+        #expect(reports.first?.totalBytes == scratch.manifest.totalSizeBytes)
+        #expect(reports.last?.fraction == 1)
     }
 
     @Test func anotherAppResumesWhatTheFirstOneDownloaded() async throws {
@@ -125,6 +158,19 @@ struct PartialResumeTests {
         #expect(!scratch.exists(scratch.partialDirectory))
     }
 
+    @Test func aClaimedModelAlsoClearsWhatItNoLongerNeeds() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let store = try scratch.store()
+        try await store.ensureAvailable(scratch.manifest)
+        try FileManager.default.createDirectory(at: scratch.partialDirectory, withIntermediateDirectories: true)
+        try Data("left".utf8).write(to: scratch.kept(scratch.weights))
+
+        try await store.ensureAvailable(scratch.manifest)
+
+        #expect(!scratch.exists(scratch.partialDirectory))
+    }
+
     @Test func aRepairUsesWhatItKept() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
@@ -150,19 +196,14 @@ struct PartialResumeTests {
         defer { scratch.cleanUp() }
         let store = try scratch.store()
         try await scratch.dropAfterFirstFile(store)
-        try Data("tampered".utf8).write(to: scratch.kept(scratch.weights))
-        let upstreamFile = scratch.upstream.appendingPathComponent(scratch.vocab.path)
-        let aside = scratch.root.appendingPathComponent("vocab-aside")
-        try FileManager.default.moveItem(at: upstreamFile, to: aside)
+        try Data(repeating: 0x00, count: scratch.weights.sizeBytes).write(to: scratch.kept(scratch.weights))
         let attempted = scratch.requests.count
 
-        await #expect(throws: LocalModelStore.LocalModelStoreError.self) {
-            try await store.ensureAvailable(scratch.manifest)
-        }
+        try await scratch.dropAfterFirstFile(store)
 
         #expect(scratch.requestsAfter(attempted) == [scratch.weights.path, scratch.vocab.path])
-        let kept = try Data(contentsOf: scratch.kept(scratch.weights))
-        #expect(kept.count == scratch.weights.sizeBytes, "the bad copy gives way to the fresh one")
+        let kept = try LocalModelStore.sha256(of: scratch.kept(scratch.weights))
+        #expect(kept == scratch.weights.sha256, "the bad copy gives way to the fresh one")
     }
 
     @Test func aFileThatFailsItsHashIsNeverKept() async throws {
@@ -198,6 +239,28 @@ struct PartialResumeTests {
         #expect(contents == [scratch.weights.sha256], "nothing was written or deleted through the link")
     }
 
+    @Test func aSymlinkForThePartialRootIsNeverUsed() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let clock = TestClock(start: Date())
+        let outside = scratch.root.appendingPathComponent("outside", isDirectory: true)
+        let foreign = outside.appendingPathComponent(scratch.key, isDirectory: true)
+        let bad = foreign.appendingPathComponent(scratch.weights.sha256)
+        try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: true)
+        try Data("not the weights".utf8).write(to: bad)
+        try FileManager.default.createDirectory(at: scratch.layout.version, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: scratch.layout.partials, withDestinationURL: outside)
+        let store = try scratch.store(clock: clock)
+
+        try await store.ensureAvailable(scratch.manifest)
+        clock.advance(days: 15)
+        _ = try await store.collectGarbage()
+        _ = try await store.remove(scratch.manifest)
+
+        #expect(try FileManager.default.contentsOfDirectory(atPath: foreign.path) == [scratch.weights.sha256])
+        #expect(scratch.exists(bad), "nothing was deleted through the link")
+    }
+
     @Test func anInstallThatCannotKeepFilesStillSucceeds() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
@@ -215,12 +278,9 @@ struct PartialResumeTests {
     func aVolumeWithoutClonesKeepsNothingAndStillInstalls(fileSystem: String) async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let image = scratch.root.appendingPathComponent("volume.dmg")
-        let mount = scratch.root.appendingPathComponent("mount", isDirectory: true)
-        try run("/usr/bin/hdiutil", "create", "-quiet", "-size", "128m", "-fs", fileSystem, "-volname", "LMSTest", image.path)
-        try run("/usr/bin/hdiutil", "attach", "-quiet", "-nobrowse", "-noautoopen", "-mountpoint", mount.path, image.path)
-        defer { try? run("/usr/bin/hdiutil", "detach", "-quiet", "-force", mount.path) }
-        let storeRoot = mount.appendingPathComponent("store", isDirectory: true)
+        let volume = try ScratchVolume(fileSystem: fileSystem, in: scratch.root)
+        defer { volume.detach() }
+        let storeRoot = volume.mount.appendingPathComponent("store", isDirectory: true)
         let store = try LocalModelStore(
             location: .directory(storeRoot), consumer: .test, session: scratch.localSession())
 
@@ -262,7 +322,7 @@ struct PartialResumeTests {
     @Test func aLaterAttemptRestartsTheGrace() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let clock = TestClock()
+        let clock = TestClock(start: Date())
         let store = try scratch.store(clock: clock)
         try await scratch.dropAfterFirstFile(store)
         clock.advance(days: 13)
@@ -277,7 +337,7 @@ struct PartialResumeTests {
     @Test func collectionDropsKeptFilesOnlyAfterTheGrace() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let clock = TestClock()
+        let clock = TestClock(start: Date())
         let store = try scratch.store(clock: clock)
         try await scratch.dropAfterFirstFile(store)
 
@@ -293,7 +353,7 @@ struct PartialResumeTests {
     @Test func collectionLeavesKeptFilesWhileAnInstallRuns() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let clock = TestClock()
+        let clock = TestClock(start: Date())
         let store = try scratch.store(clock: clock)
         try await scratch.dropAfterFirstFile(store)
         clock.advance(days: 15)
@@ -308,7 +368,7 @@ struct PartialResumeTests {
     @Test func collectionDropsWhatACrashLeftBesideAClaimedModel() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let clock = TestClock()
+        let clock = TestClock(start: Date())
         let store = try scratch.store(clock: clock)
         try await store.ensureAvailable(scratch.manifest)
         try FileManager.default.createDirectory(at: scratch.partialDirectory, withIntermediateDirectories: true)
@@ -321,10 +381,28 @@ struct PartialResumeTests {
         #expect(await store.verify(scratch.manifest).isComplete, "the model stays")
     }
 
+    @Test func collectingAModelAlsoDropsWhatItKept() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let clock = TestClock(start: Date())
+        let store = try scratch.store(clock: clock)
+        try await store.ensureAvailable(scratch.manifest)
+        try await store.reconcileClaims(keeping: [])
+        clock.advance(days: 15)
+        try FileManager.default.createDirectory(at: scratch.partialDirectory, withIntermediateDirectories: true)
+        try Data("left".utf8).write(to: scratch.kept(scratch.weights))
+        try FileManager.default.setAttributes([.modificationDate: clock.now], ofItemAtPath: scratch.partialDirectory.path)
+
+        let report = try await store.collectGarbage()
+
+        #expect(report.removed == [scratch.key])
+        #expect(!scratch.exists(scratch.partialDirectory), "the model took them along, inside their grace")
+    }
+
     @Test func collectionNeverDeletesThroughASymlink() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
-        let clock = TestClock()
+        let clock = TestClock(start: Date())
         let store = try scratch.store(clock: clock)
         try await scratch.dropAfterFirstFile(store)
         let outside = scratch.root.appendingPathComponent("outside", isDirectory: true)

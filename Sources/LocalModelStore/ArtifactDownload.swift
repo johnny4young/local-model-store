@@ -35,9 +35,26 @@ enum ArtifactDownload {
                 }
             }
         }
-        defer { watcher.cancel() }
+        let outcome: Result<URLResponse, any Error>
+        do {
+            outcome = .success(try await transfer(session: session, from: source, to: destination, state: state))
+        } catch {
+            outcome = .failure(error)
+        }
+        // Waited for, so no report lands after this returns, when another process may
+        // hold the lock those reports are written to.
+        watcher.cancel()
+        await watcher.value
+        return try outcome.get()
+    }
 
-        return try await withTaskCancellationHandler {
+    private static func transfer(
+        session: URLSession,
+        from source: URL,
+        to destination: URL,
+        state: OSAllocatedUnfairLock<TaskState>
+    ) async throws -> URLResponse {
+        try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let task = session.downloadTask(with: source) { location, response, error in
                     continuation.resume(

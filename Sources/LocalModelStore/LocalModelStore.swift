@@ -100,6 +100,7 @@ public actor LocalModelStore {
         // removal in another process cannot miss it.
         if await verifiedInstallation(manifest) != nil, claims.isActive(manifest.storeKey, consumer: consumer) {
             claims.touch(manifest.storeKey, consumer: consumer)
+            await discardPartial(manifest.storeKey)
             return base
         }
         try Task.checkCancellation()
@@ -110,8 +111,7 @@ public actor LocalModelStore {
         // Nil means a stalled holder or no `flock`: installing anyway is safe,
         // because publishing is atomic and every file is hashed first.
         let lock = try await acquireInstallLock(for: manifest, progress: progress)
-        // Explicit, because a download's watcher can outlive this call for a moment
-        // while holding the lock through its progress closure.
+        // Ends the hold at the return, whatever still references the lock.
         defer { lock?.unlock() }
         // A crashed or finished holder's progress must not read as this one's.
         lock?.write(Data())
@@ -122,14 +122,19 @@ public actor LocalModelStore {
             try Task.checkCancellation()
             try await install(manifest, seeds: seeds, lock: lock, progress: progress)
         }
-        // Also clears what a crash left between publishing and this line.
-        let partial = layout.partial(manifest.storeKey)
-        await Self.offActor { try? FileManager.default.removeItem(at: partial) }
+        await discardPartial(manifest.storeKey)
         try Self.storing("claim") { try claims.write(manifest, consumer: consumer) }
         return base
     }
 
     // MARK: - Internals
+
+    /// Kept files have no use once the model is verified, whoever installed it.
+    private func discardPartial(_ key: String) async {
+        let partial = layout.partial(key)
+        guard layout.partialsAreReal, FileFingerprint.read(partial) != .missing else { return }
+        await Self.offActor { try? FileManager.default.removeItem(at: partial) }
+    }
 
     private func evidence(for manifest: ModelManifest) -> VerifiedInstallation {
         VerifiedInstallation(
@@ -198,7 +203,7 @@ public actor LocalModelStore {
         let payload = staging.url.appendingPathComponent("payload", isDirectory: true)
         let key = manifest.storeKey
         // Collection counts its grace from the last attempt.
-        if case .directory = FileFingerprint.read(layout.partial(key)) {
+        if layout.partialsAreReal, case .directory = FileFingerprint.read(layout.partial(key)) {
             try? FileManager.default.setAttributes([.modificationDate: now()], ofItemAtPath: layout.partial(key).path)
         }
 
@@ -207,7 +212,7 @@ public actor LocalModelStore {
         var toFetch: [ModelArtifact] = []
         var placedBytes = 0
         for artifact in manifest.artifacts {
-            let kept = LocalSource(root: layout.partials, path: Self.partialPath(artifact, key: key))
+            let kept = LocalSource(root: layout.version, path: layout.keptPath(artifact, key: key))
             let sources = [LocalSource(root: layout.payload(key), path: artifact.path), kept]
                 + seeds.map { LocalSource(root: $0, path: artifact.path) }
                 + (sharedSources[artifact.sha256] ?? [])
@@ -216,15 +221,16 @@ public actor LocalModelStore {
                 // A long copy from a slow disk must not read as a stall to waiters.
                 lock?.write(ProgressReport(completedBytes: placedBytes, totalBytes: manifest.totalSizeBytes).encoded)
             } else {
-                // Whatever was kept failed its hash, and would block keeping a good copy.
+                // Whatever was kept could not be used, and would block keeping a good copy.
                 ModelInstaller.discardKept(kept.path, under: kept.root)
                 toFetch.append(artifact)
             }
         }
         try checkFreeSpace(for: toFetch)
 
-        let totalBytes = toFetch.reduce(0) { $0 + $1.sizeBytes }
-        var completedBytes = 0
+        // The whole model, so a resumed install continues from where it stopped.
+        let totalBytes = manifest.totalSizeBytes
+        var completedBytes = placedBytes
         for artifact in toFetch {
             let completed = completedBytes
             let onBytes: @Sendable (Int) -> Void = { written in
@@ -408,15 +414,10 @@ public actor LocalModelStore {
                 path: artifact.path, expected: artifact.sha256, actual: digest)
         }
 
-        ModelInstaller.keep(staged, under: layout.partials, path: Self.partialPath(artifact, key: manifest.storeKey))
+        ModelInstaller.keep(staged, under: layout.version, path: layout.keptPath(artifact, key: manifest.storeKey))
 
         try Task.checkCancellation()
         try Self.storing(artifact.path) { try FileManager.default.moveItem(at: staged, to: destination) }
-    }
-
-    /// By hash, so no manifest path decides where a kept file lands.
-    private static func partialPath(_ artifact: ModelArtifact, key: String) -> String {
-        "\(key)/\(artifact.sha256)"
     }
 }
 
