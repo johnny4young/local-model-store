@@ -68,7 +68,8 @@ Any client may delete a staging directory whose owner file it can lock, then the
 
 - Write it during an install, only as a clone of the verified file, so it costs no space. An install racing a stalled holder or on a volume with no `flock` writes it with no lock, which hashing keeps safe. A volume without clones keeps nothing, and an interrupted install starts over there. A failure to keep a file does not fail the install.
 - Set the modification time of `partial/<key>/` when an install starts.
-- Delete `partial/<key>/` once the model is verified, and when a removal or a collection retires the model.
+- Once the model is verified, delete `partial/<key>/` while holding the install lock, unless the install is already racing without it. If the lock is busy, leave the directory for later.
+- Delete it when a removal or a collection retires the model.
 - A collection also renames `partial/<key>/` into `trash/` when the install lock is free and, read while holding it, the directory has not changed for 14 days. An existing claim does not protect it.
 
 A client that does not know this directory ignores it, so the format version does not change.

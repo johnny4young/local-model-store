@@ -87,7 +87,8 @@ public actor LocalModelStore {
     /// Ensures the model is installed and verified, placing each file from what is
     /// already on this Mac when it can and downloading the rest. Returns the
     /// directory to load. `seeds` are read-only directories shaped like the payload,
-    /// such as a legacy install; their bytes count only after hashing.
+    /// such as a legacy install; their bytes count only after hashing. `progress` runs
+    /// on the install's own path and must not block, or the install waits with it.
     @discardableResult
     public func ensureAvailable(
         _ manifest: ModelManifest,
@@ -100,7 +101,7 @@ public actor LocalModelStore {
         // removal in another process cannot miss it.
         if await verifiedInstallation(manifest) != nil, claims.isActive(manifest.storeKey, consumer: consumer) {
             claims.touch(manifest.storeKey, consumer: consumer)
-            await discardPartial(manifest.storeKey)
+            await discardPartialIfIdle(manifest.storeKey)
             return base
         }
         try Task.checkCancellation()
@@ -128,6 +129,15 @@ public actor LocalModelStore {
     }
 
     // MARK: - Internals
+
+    /// The fast path waits for nobody: a busy lock may mean a new install is using them,
+    /// and a later call clears them.
+    private func discardPartialIfIdle(_ key: String) async {
+        guard FileFingerprint.read(layout.partial(key)) != .missing,
+              case .acquired(let lock)? = try? FileLock.tryExclusive(at: layout.installLock(key)) else { return }
+        await discardPartial(key)
+        lock.unlock()
+    }
 
     /// Kept files have no use once the model is verified, whoever installed it.
     private func discardPartial(_ key: String) async {

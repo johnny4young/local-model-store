@@ -171,6 +171,23 @@ struct PartialResumeTests {
         #expect(!scratch.exists(scratch.partialDirectory))
     }
 
+    @Test func aBusyInstallLockLeavesKeptFilesForALaterCall() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        let store = try scratch.store()
+        try await store.ensureAvailable(scratch.manifest)
+        try FileManager.default.createDirectory(at: scratch.partialDirectory, withIntermediateDirectories: true)
+        try Data("in use".utf8).write(to: scratch.kept(scratch.weights))
+        let held = try FileLock.tryExclusive(at: scratch.lockFile)
+
+        try await store.ensureAvailable(scratch.manifest)
+        #expect(scratch.exists(scratch.kept(scratch.weights)))
+
+        held.release()
+        try await store.ensureAvailable(scratch.manifest)
+        #expect(!scratch.exists(scratch.partialDirectory))
+    }
+
     @Test func aRepairUsesWhatItKept() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
