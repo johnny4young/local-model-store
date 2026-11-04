@@ -8,7 +8,9 @@ struct StoreLayout: Sendable {
     var models: URL { version.appendingPathComponent("models", isDirectory: true) }
     var trash: URL { version.appendingPathComponent("trash", isDirectory: true) }
     var claims: URL { version.appendingPathComponent("claims", isDirectory: true) }
+    var partials: URL { version.appendingPathComponent("partial", isDirectory: true) }
 
+    func partial(_ key: String) -> URL { partials.appendingPathComponent(key, isDirectory: true) }
     func model(_ key: String) -> URL { models.appendingPathComponent(key, isDirectory: true) }
     func payload(_ key: String) -> URL { model(key).appendingPathComponent("payload", isDirectory: true) }
     func installLock(_ key: String) -> URL { version.appendingPathComponent("locks/\(key).lock") }

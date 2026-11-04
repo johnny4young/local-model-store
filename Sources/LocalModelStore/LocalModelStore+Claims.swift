@@ -109,8 +109,10 @@ extension LocalModelStore {
         guard remaining.isEmpty else { return .keptForOthers(remaining.map(\.displayName)) }
         // The user asked for this, so a volume that cannot show leases does not stop it.
         guard case .retired(let doomed) = try retire(key, ifUseIsUnknown: true) else { return .deferred }
+        let partial = retirePartial(key)
         lock.release()
         await deleteBytes(doomed)
+        await deleteBytes(partial)
         return .removed
     }
 
@@ -144,6 +146,13 @@ extension LocalModelStore {
         return .retired(doomed: doomed)
     }
 
+    /// Renamed away under the lock, like a model, so deleting it never holds the lock.
+    private func retirePartial(_ key: String) -> URL? {
+        let doomed = layout.trash.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(at: layout.trash, withIntermediateDirectories: true)
+        return (try? FileManager.default.moveItem(at: layout.partial(key), to: doomed)) == nil ? nil : doomed
+    }
+
     private func deleteBytes(_ doomed: URL?) async {
         guard let doomed else { return }
         await Self.offActor { try? FileManager.default.removeItem(at: doomed) }
@@ -169,8 +178,9 @@ extension LocalModelStore {
         }
     }
 
-    /// Deletes models nobody claims or uses, retired claims past their grace, and
-    /// work abandoned in staging and trash. A model being installed or leased stays.
+    /// Deletes models nobody claims or uses, retired claims past their grace, kept
+    /// downloads past theirs, and work abandoned in staging and trash. A model being
+    /// installed or leased stays.
     public func collectGarbage() async throws -> GarbageReport {
         guard FileManager.default.fileExists(atPath: layout.version.path) else {
             return GarbageReport(removed: [], inUse: [], failed: [])
@@ -202,8 +212,25 @@ extension LocalModelStore {
             }
         }
         dropClaimsOfMissingModels()
+        await collectPartials()
         await emptyTrashAndStaging()
         return GarbageReport(removed: removed, inUse: inUse, failed: failed)
+    }
+
+    /// By age alone: an install claims only after it succeeds, so a claim says nothing
+    /// about kept files. An unknown lock proceeds, because the grace already outlasts any attempt.
+    private func collectPartials() async {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: layout.partials.path)) ?? []
+        for key in names {
+            let path = layout.partial(key).path
+            guard let touched = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+                  now().timeIntervalSince(touched) >= ClaimStore.retiredGrace,
+                  let lock = try? FileLock.tryExclusive(at: layout.installLock(key)) else { continue }
+            if case .busy = lock { continue }
+            let doomed = retirePartial(key)
+            lock.release()
+            await deleteBytes(doomed)
+        }
     }
 
     /// Under each key's lock, so a claim from an install that just finished survives.

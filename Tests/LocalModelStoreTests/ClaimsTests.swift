@@ -700,13 +700,4 @@ struct AcceptanceTests {
         #expect(scratch.requests.count == before)
         #expect(await local.verify(scratch.manifest).isComplete)
     }
-
-    private func run(_ tool: String, _ arguments: String...) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: tool)
-        process.arguments = arguments
-        try process.run()
-        process.waitUntilExit()
-        try #require(process.terminationStatus == 0, "\(tool) \(arguments)")
-    }
 }

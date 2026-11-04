@@ -123,6 +123,15 @@ private func clientExecutable() throws -> URL {
     return url
 }
 
+func run(_ tool: String, _ arguments: String...) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: tool)
+    process.arguments = arguments
+    try process.run()
+    process.waitUntilExit()
+    try #require(process.terminationStatus == 0, "\(tool) \(arguments)")
+}
+
 func finish(_ process: Process) async {
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
         DispatchQueue.global().async {
@@ -139,7 +148,7 @@ final class Events: Sendable {
     func add(_ event: LocalModelStore.InstallEvent) { state.withLock { $0.append(event) } }
 }
 
-final class LocalUpstream: URLProtocol, @unchecked Sendable {
+class LocalUpstream: URLProtocol, @unchecked Sendable {
     private static let directories = OSAllocatedUnfairLock<[String: URL]>(initialState: [:])
     private static let seen = OSAllocatedUnfairLock<[String: [String]]>(initialState: [:])
 
