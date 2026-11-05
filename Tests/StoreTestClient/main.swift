@@ -2,11 +2,23 @@ import Foundation
 import LocalModelStore
 
 // A second real process for the multiprocess tests. It installs through the
-// public store API from a fixture upstream and logs what it does.
+// public store API from a fixture upstream and logs what it does. With `--hash`,
+// it only hashes a file, so its peak footprint belongs to the hash.
 func argument(_ name: String) -> String? {
     guard let index = CommandLine.arguments.firstIndex(of: "--\(name)"),
           index + 1 < CommandLine.arguments.count else { return nil }
     return CommandLine.arguments[index + 1]
+}
+
+if let file = argument("hash") {
+    let digest = try LocalModelStore.sha256(of: URL(fileURLWithPath: file))
+    var usage = rusage_info_v4()
+    let status = withUnsafeMutablePointer(to: &usage) {
+        $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_V4, $0) }
+    }
+    guard status == 0 else { fatalError("proc_pid_rusage failed: \(errno)") }
+    print(digest, usage.ri_lifetime_max_phys_footprint)
+    exit(0)
 }
 
 func log(_ line: String) {
@@ -54,7 +66,7 @@ final class FixtureUpstream: URLProtocol, @unchecked Sendable {
 }
 
 guard let root = argument("root"), let manifestPath = argument("manifest"), let upstream = argument("upstream") else {
-    fatalError("usage: store-test-client --root R --manifest M --upstream U [--log L] [--hold-file F] [--hold-only NAME] [--stall-ms N] [--consumer C] [--hold-lease] [--crash-after-publish]")
+    fatalError("usage: store-test-client --hash FILE | --root R --manifest M --upstream U [--log L] [--hold-file F] [--hold-only NAME] [--stall-ms N] [--consumer C] [--hold-lease] [--crash-after-publish]")
 }
 FixtureUpstream.directory = URL(fileURLWithPath: upstream, isDirectory: true)
 FixtureUpstream.holdFile = argument("hold-file")
