@@ -123,6 +123,19 @@ private func clientExecutable() throws -> URL {
     return url
 }
 
+/// Runs the client with only these arguments and returns what it prints.
+func clientOutput(_ arguments: [String]) async throws -> String {
+    let process = Process()
+    process.executableURL = try clientExecutable()
+    process.arguments = arguments
+    let output = Pipe()
+    process.standardOutput = output
+    try process.run()
+    await finish(process)
+    try #require(process.terminationStatus == 0, "store-test-client \(arguments)")
+    return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+}
+
 private func run(_ tool: String, _ arguments: String...) throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: tool)

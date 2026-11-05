@@ -269,15 +269,20 @@ extension LocalModelStore {
 
     /// Streaming SHA-256 (1 MiB reads) so a 445 MB weight file never has to
     /// fit in memory.
-    static func sha256(of url: URL) throws -> String {
+    package static func sha256(of url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
         var hasher = SHA256()
-        while true {
+        var reading = true
+        while reading {
             try Task.checkCancellation()
-            guard let data = try handle.read(upToCount: 1 << 20), !data.isEmpty else { break }
-            hasher.update(data: data)
+            // Each read returns an autoreleased buffer, and no pool drains inside this loop.
+            reading = try autoreleasepool {
+                guard let data = try handle.read(upToCount: 1 << 20), !data.isEmpty else { return false }
+                hasher.update(data: data)
+                return true
+            }
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
