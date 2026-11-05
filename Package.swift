@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "LocalModelStore",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
         .library(name: "LocalModelStore", targets: ["LocalModelStore"])
     ],

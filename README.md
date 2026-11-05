@@ -8,7 +8,7 @@ Each app verifies every file against SHA-256 values compiled into its own binary
 
 ## Requirements
 
-macOS 14 or later, Swift 6.2 or later. No dependencies.
+macOS 14 or iOS 17 or later, Swift 6.2 or later. No dependencies.
 
 ## License
 
