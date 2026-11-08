@@ -94,6 +94,8 @@ A client that does not know this directory ignores it, so the format version doe
 - When an update stops pinning a model, set `retiredAt`. A retired claim still protects the model for 14 days, so a rollback downloads nothing. Clear it, under the install lock, as soon as the model is used again.
 - A claim is not consent. Each app asks before its own first use of a model.
 
+A client adopting an already verified installation must also create or restore its own claim. In Swift, `claimInstalled` does this under the install lock when the volume supports it, returns nil for missing or damaged bytes, and never downloads or repairs. A busy install lock is reported as `busy` so the client can retry instead of writing an unprotected claim. Merely verifying or leasing an installation does not create a claim.
+
 ## Leases
 
 `locks/<key>.use` is held with `flock(LOCK_SH)` while a process has the model loaded. Take it before verifying. A deleter must get `LOCK_EX`. The kernel releases it when the holder dies.
