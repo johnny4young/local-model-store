@@ -13,7 +13,7 @@ extension LocalModelStore {
         /// A sandboxed process asked for the shared store, which it cannot reach.
         case sandboxed
         case invalidConsumer(bundleID: String)
-        /// Another process is deleting this model right now.
+        /// Another process holds this model's lock right now; try again later.
         case busy(id: String)
 
         public var errorDescription: String? {
@@ -35,7 +35,7 @@ extension LocalModelStore {
             case .invalidConsumer(let bundleID):
                 return "invalid consumer bundle ID: \(bundleID)"
             case .busy(let id):
-                return "model \(id) is being removed"
+                return "model \(id) is busy in another process"
             }
         }
     }
