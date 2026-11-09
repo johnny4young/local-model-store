@@ -42,6 +42,36 @@ struct AdoptionTests {
         #expect(scratch.requests == requests)
     }
 
+    @Test func concurrentAdoptionsInOneProcessAreNotBusy() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        try await store(scratch, consumer: installer).ensureAvailable(scratch.manifest)
+        let second = try store(scratch, consumer: adopter)
+        let manifest = scratch.manifest
+
+        let claimed = try await withThrowingTaskGroup(of: Bool.self) { group in
+            for _ in 0..<4 { group.addTask { try await second.claimInstalled(manifest) != nil } }
+            return try await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        }
+
+        #expect(claimed == 4)
+    }
+
+    @Test func anActiveClaimIsRefreshedWhileAnotherProcessHoldsTheLock() async throws {
+        let scratch = try Scratch()
+        defer { scratch.cleanUp() }
+        try await store(scratch, consumer: installer).ensureAvailable(scratch.manifest)
+        let second = try store(scratch, consumer: adopter)
+        #expect(try await second.claimInstalled(scratch.manifest) != nil)
+        guard case .acquired(let held) = try FileLock.tryExclusive(at: scratch.lockFile) else {
+            Issue.record("The test must hold the install lock")
+            return
+        }
+        defer { held.unlock() }
+
+        #expect(try await second.claimInstalled(scratch.manifest) != nil)
+    }
+
     @Test func aMissingInstallationCreatesNothingAndDownloadsNothing() async throws {
         let scratch = try Scratch()
         defer { scratch.cleanUp() }
