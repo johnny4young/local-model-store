@@ -19,7 +19,6 @@ extension LocalModelStore {
             return nil
         }
         try Task.checkCancellation()
-        let claims = ClaimStore(layout: layout, now: now)
         if claims.isActive(manifest.storeKey, consumer: consumer) {
             claims.touch(manifest.storeKey, consumer: consumer)
         } else {

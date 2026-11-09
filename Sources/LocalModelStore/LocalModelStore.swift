@@ -14,7 +14,7 @@ public actor LocalModelStore {
     private let availableCapacity: @Sendable (URL) -> Int64?
     var verifiedFingerprints: [String: [FileFingerprint]] = [:]
     private(set) var fullInspectionCount = 0
-    private var claims: ClaimStore { ClaimStore(layout: layout, now: now) }
+    var claims: ClaimStore { ClaimStore(layout: layout, now: now) }
 
     nonisolated public let consumer: StoreConsumer
 

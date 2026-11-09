@@ -37,8 +37,6 @@ extension LocalModelStore {
         public let failed: [String]
     }
 
-    private var claims: ClaimStore { ClaimStore(layout: layout, now: now) }
-
     /// Keeps a model on disk while it is resident. Call `release()` when it unloads;
     /// dropping the last reference and crashing also release it.
     public final class ModelLease: Sendable {
